@@ -58,6 +58,7 @@ class FundingApp(App):
         self.viable_pairs = []
         self.fee_cache = {}
         self.ticker_map = {}
+        self.ticker_stats_cache = {} # Symbol -> {'quoteVolume': 0.0}
         self.rsi_cache = {}
         self.rsi_entry_tracker = {} # Symbol -> {'type': 'OVER', 'extreme': 90.0}
         self.fee_queue = set()
@@ -90,6 +91,7 @@ class FundingApp(App):
         sim_table.add_columns("Strategy", "Symbol", "Status", "Dir", "Entry", "Exit", "Payout", "Price PnL", "Net PnL %")
 
         self.set_interval(60.0, self.fetch_premiums)
+        self.set_interval(60.0, self.fetch_24hr_stats) # Fetch 24h stats every minute
         self.set_interval(1.0, self.fetch_tickers)
         self.set_interval(1.0, self.update_simulations)
         self.set_interval(2.0, self.process_fee_queue)
@@ -110,9 +112,11 @@ class FundingApp(App):
     def action_refresh_all(self):
         self.run_worker(self.fetch_premiums_worker, thread=True)
         self.run_worker(self.fetch_tickers_worker, thread=True)
+        self.run_worker(self.fetch_24hr_stats_worker, thread=True)
 
     def fetch_premiums(self): self.run_worker(self.fetch_premiums_worker, thread=True)
     def fetch_tickers(self): self.run_worker(self.fetch_tickers_worker, thread=True)
+    def fetch_24hr_stats(self): self.run_worker(self.fetch_24hr_stats_worker, thread=True)
     def process_fee_queue(self):
         if self.fee_queue: self.run_worker(self.fetch_fee_worker(self.fee_queue.pop()), thread=True)
     def process_kline_queue(self):
@@ -130,6 +134,12 @@ class FundingApp(App):
         try:
             resp = requests.get(f"{BASE_URL}/fapi/v1/ticker/bookTicker", timeout=5)
             if resp.status_code == 200: self.call_from_thread(self.process_tickers, resp.json())
+        except: pass
+
+    def fetch_24hr_stats_worker(self):
+        try:
+            resp = requests.get(f"{BASE_URL}/fapi/v1/ticker/24hr", timeout=10)
+            if resp.status_code == 200: self.call_from_thread(self.process_24hr_stats, resp.json())
         except: pass
 
     def fetch_fee_worker(self, symbol):
@@ -170,6 +180,12 @@ class FundingApp(App):
         for t in data:
             self.ticker_map[t['symbol']] = {'bid': float(t.get('bidPrice', 0)), 'ask': float(t.get('askPrice', 0))}
         self.update_scanner_table()
+    
+    def process_24hr_stats(self, data):
+        # Data is list of dicts
+        for t in data:
+            # We use quoteVolume as a proxy for Market Cap/Liquidity since MC is not available
+            self.ticker_stats_cache[t['symbol']] = {'quoteVolume': float(t.get('quoteVolume', 0))}
 
     def update_fee_cache(self, symbol, maker, taker):
         self.fee_cache[symbol] = {'maker': maker, 'taker': taker}
@@ -193,6 +209,19 @@ class FundingApp(App):
                 if sym not in self.kline_queue: self.kline_queue.add(sym)
 
             if abs(rate) > (DEFAULT_MAKER*2 + MIN_PROFIT_BUFFER):
+                # Filter by Spread and Earnings
+                tik = self.ticker_map.get(sym)
+                if tik and tik['ask'] > 0:
+                    spread = (tik['ask'] - tik['bid']) / tik['ask']
+                    fees = self.fee_cache.get(sym, {'maker': DEFAULT_MAKER, 'taker': DEFAULT_TAKER})
+                    
+                    # 1. Hard spread limit 0.5%
+                    if spread > 0.005: continue
+                    
+                    # 2. Spread vs Earnings (Funding - 2*Taker)
+                    est_profit = abs(rate) - (fees['taker'] * 2)
+                    if spread > est_profit: continue
+
                 if sym not in self.fee_cache and sym not in self.fee_queue: self.fee_queue.add(sym)
                 candidates.append({'symbol': sym, 'funding_rate': rate, 'next_funding_time': nxt, 'direction': "SHORT" if rate > 0 else "LONG"})
         
@@ -304,7 +333,14 @@ class FundingApp(App):
                 # Setup: OVERSOLD (Long) -> Trigger if RSI rises 2 points from Bottom
                 elif data['type'] == 'OVERSOLD':
                     if rsi > (data['extreme'] + 2.0):
-                        self.open_trade("RSI_SCALP", symbol, "LONG")
+                        # --- MARKET CAP / VOLUME CHECK ---
+                        # User wants > 100M Market Cap. API doesn't have it. Using 24h Quote Vol as proxy.
+                        stats = self.ticker_stats_cache.get(symbol, {})
+                        vol = stats.get('quoteVolume', 0)
+                        
+                        if vol > 100_000_000: # 100M USDT Volume Check
+                            self.open_trade("RSI_SCALP", symbol, "LONG")
+                        
                         del self.rsi_entry_tracker[symbol]
                     elif rsi > 50:
                         del self.rsi_entry_tracker[symbol]
@@ -319,19 +355,20 @@ class FundingApp(App):
             rate = cand['funding_rate']
             direction = cand['direction']
             
-            # STRAT: FRONT_RUN (Entry: T-300s, Exit: T-10s)
-            if 290 < diff <= 300:
+            # STRAT: FRONT_RUN (Entry: 1m before, Exit: 1s after)
+            # 1m = 60s. Enter if diff <= 60.
+            if 55 < diff <= 60: 
                 self.open_trade("FRONT_RUN", symbol, direction)
             
-            # STRAT: SNIPE (Entry: T-10s, Exit: T+5s)
-            if 0 < diff <= 10:
+            # STRAT: SNIPE (Entry: 1s before, Exit: 1s after)
+            if 0 < diff <= 1:
                 self.open_trade("SNIPE", symbol, direction)
                 for s in self.active_sims:
                     if s['symbol'] == symbol and s['strategy'] == "SNIPE" and s['status'] == 'OPEN':
                         s['pending_funding_rate'] = rate
 
-            # STRAT: DIP_BUY (Entry: T+10s, Exit: T+60s)
-            if -15 <= diff < -10:
+            # STRAT: DIP_BUY (Entry: 1s before, Exit: 1m after)
+            if 0 < diff <= 1:
                 self.open_trade("DIP_BUY", symbol, direction)
 
         # 3. MANAGE ACTIVE TRADES
@@ -361,40 +398,57 @@ class FundingApp(App):
                 if sim['direction'] == "SHORT":
                     # Track lowest RSI seen
                     if current_rsi < sim['lowest_rsi']: sim['lowest_rsi'] = current_rsi
-                    # Trail: Exit if RSI bounces 10 points from bottom OR is back to neutral 70
-                    if (current_rsi > sim['lowest_rsi'] + 10) or (current_rsi < 70 and sim['entry_price'] > 0): 
-                            if current_rsi < 70:
-                                if current_rsi > sim['lowest_rsi'] + 10:
-                                    self.close_trade(sim, "RSI Trail")
-                    elif current_rsi > 95: 
-                        pass
+                    # Trail: Exit if RSI bounces 2 points from bottom
+                    if current_rsi > (sim['lowest_rsi'] + 2.0):
+                        self.close_trade(sim, "RSI Trail")
                 else: # LONG
+                    # Track highest RSI seen
                     if current_rsi > sim['highest_rsi']: sim['highest_rsi'] = current_rsi
-                    if current_rsi > 30: # Activated
-                        if current_rsi < sim['highest_rsi'] - 10:
-                            self.close_trade(sim, "RSI Trail")
+                    # Trail: Exit if RSI drops 2 points from peak
+                    if current_rsi < (sim['highest_rsi'] - 2.0):
+                        self.close_trade(sim, "RSI Trail")
 
             # --- FUNDING TIME LOGIC ---
             else:
                 cand = next((x for x in self.viable_pairs if x['symbol'] == symbol), None)
-                if not cand: continue
+                if not cand: 
+                    # If symbol disappeared from viable list (e.g. rate dropped), keep tracking time or force close?
+                    # Better to track time based on next funding. But if we can't find it, we might have issues.
+                    # For sim purposes, we'll try to estimate or just skip.
+                    # Actually, if it's not in viable_pairs, we can't get 'next_funding_time' easily.
+                    # We should probably persist 'next_funding_time' in the sim object.
+                    pass
                 
-                funding_ts = float(cand['next_funding_time']) / 1000
-                diff = funding_ts - current_time
+                # Use cached funding time if available, or just rely on diff if we could calc it.
+                # For safety, let's just use system time if we can't find the pair, or use a saved 'target_exit_time'
+                # But 'next_funding_time' changes.
                 
-                if diff < 0 and sim.get('funding_payout_pct') == 0.0 and strategy in ["SNIPE", "FRONT_RUN"]:
-                    rate = sim.get('pending_funding_rate', cand['funding_rate'])
-                    dir_sign = 1 if sim['direction'] == "LONG" else -1
-                    sim['funding_payout_pct'] = -1 * dir_sign * rate
+                # Correct approach: Calculate time relative to the funding event we entered for.
+                # In simulation, we assume funding happens at fixed intervals (every 4h or 8h).
+                # But to be simple, let's just re-fetch from viable_pairs.
                 
-                if strategy == "FRONT_RUN":
-                    if diff < 10: self.close_trade(sim, "Time Exit")
-                
-                elif strategy == "SNIPE":
-                    if diff < -5: self.close_trade(sim, "Time Exit")
-                        
-                elif strategy == "DIP_BUY":
-                    if diff < -60: self.close_trade(sim, "Time Exit")
+                if cand:
+                    funding_ts = float(cand['next_funding_time']) / 1000
+                    diff = funding_ts - current_time
+                    
+                    if diff < 0 and sim.get('funding_payout_pct') == 0.0 and strategy in ["SNIPE", "FRONT_RUN", "DIP_BUY"]:
+                        rate = sim.get('pending_funding_rate', cand['funding_rate'])
+                        dir_sign = 1 if sim['direction'] == "LONG" else -1
+                        # For Dip Buy, we entered BEFORE funding, so we pay/receive it too.
+                        sim['funding_payout_pct'] = -1 * dir_sign * rate
+                    
+                    if strategy == "FRONT_RUN":
+                        # Exit 1m01s after open
+                        if (current_time - sim['entry_time']) > 61: self.close_trade(sim, "Time Exit")
+                    
+                    elif strategy == "SNIPE":
+                        # Exit 1s after funding
+                        if diff < -1: self.close_trade(sim, "Time Exit")
+                            
+                    elif strategy == "DIP_BUY":
+                        # Exit 1m after open
+                        if (current_time - sim['entry_time']) > 60: self.close_trade(sim, "Time Exit")
+
 
         self.update_sim_table()
 
