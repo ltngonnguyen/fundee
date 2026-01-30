@@ -1,0 +1,15 @@
+[Unit]
+Description=Funding Bot Hybrid Headless Service
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/home/johnd/funding-hybrid/.env
+User=johnd
+WorkingDirectory=/home/johnd/funding-hybrid
+ExecStart=/usr/bin/python3 /home/johnd/funding-hybrid/funding_bot_real.py --headless
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
