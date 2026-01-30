@@ -28,8 +28,6 @@ except ImportError:
 
 from funding_shared import ExchangeInterface, BASE_URL
 
-from funding_shared import ExchangeInterface, BASE_URL
-
 # ==========================================
 # CONFIGURATION
 # ==========================================

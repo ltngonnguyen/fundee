@@ -4,6 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
+EnvironmentFile=/home/johnd/funding/.env
 User=johnd
 WorkingDirectory=/home/johnd/funding
 ExecStart=/home/johnd/funding/venv/bin/python /home/johnd/funding/funding_bot_real.py --headless

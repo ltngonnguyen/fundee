@@ -12,6 +12,7 @@ from queue import Queue
 from urllib.parse import urlencode
 
 import requests
+from funding_shared import ExchangeInterface
 
 try:
     from textual.app import App, ComposeResult
