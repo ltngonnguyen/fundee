@@ -15,7 +15,7 @@ from urllib.parse import urlencode
 import requests
 
 try:
-    from eth_abi import encode
+    from eth_abi.abi import encode
     from eth_account import Account
     from eth_account.messages import encode_defunct
     from web3 import Web3
@@ -183,7 +183,7 @@ class ExchangeInterface:
                 self.log(f"Balance fetch failed: {resp.status_code} {resp.text}")
         except Exception as e:
             self.log(f"Balance Exception: {e}")
-        return 0.0
+        return None
 
     def get_positions(self):
         if not API_SECRET: return []
@@ -321,7 +321,8 @@ class FundingLogic:
             self.interface.call_from_thread(self.interface.log_message, f"Sync Error: {e}")
 
     def update_account_state(self, balance, positions):
-        self.balance = balance
+        if balance is not None:
+            self.balance = balance
         # Map real positions to strategies? 
         # For now, we just trust our local state for strategy logic, 
         # but we could add a safety check here to close "orphan" positions not in our list.

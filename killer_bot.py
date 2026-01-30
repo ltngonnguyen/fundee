@@ -13,7 +13,7 @@ from urllib.parse import urlencode
 import requests
 
 try:
-    from eth_abi import encode
+    from eth_abi.abi import encode
     from eth_account import Account
     from eth_account.messages import encode_defunct
     from web3 import Web3
