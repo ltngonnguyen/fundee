@@ -40,8 +40,8 @@ SIGNER_ADDRESS = os.getenv("ASTER_SIGNER_ADDRESS", USER_ADDRESS)
 TRADE_SIZE_USDT = 100.0  # Size per trade in USDT
 
 # Defaults
-DEFAULT_MAKER = 0.0002
-DEFAULT_TAKER = 0.0004
+DEFAULT_MAKER = 0.00005  # 0.005%
+DEFAULT_TAKER = 0.0004   # 0.04%
 MIN_PROFIT_BUFFER = 0.0002
 
 
@@ -66,6 +66,7 @@ class FundingLogic:
         # Track local strategy state
         self.active_strategies = []
         self.closed_strategies = []
+        self.real_positions = []
         self.sim_counter = 0
 
         # Log file
@@ -153,6 +154,7 @@ class FundingLogic:
         self.interface.set_interval(1.0, self.fetch_tickers)
         self.interface.set_interval(1.0, self.update_strategies)
         self.interface.set_interval(2.0, self.process_fee_queue)
+        self.interface.set_interval(5.0, self.safety_monitor)  # Run safety check every 5s
         self.refresh_all()
 
     def refresh_all(self):
@@ -181,10 +183,96 @@ class FundingLogic:
     def update_account_state(self, balance, positions):
         if balance is not None:
             self.balance = balance
-        # Map real positions to strategies?
-        # For now, we just trust our local state for strategy logic,
-        # but we could add a safety check here to close "orphan" positions not in our list.
+        if positions is not None:
+            self.real_positions = positions
         self.interface.update_ui()
+
+    def safety_monitor(self):
+        """
+        Integrated 'Killer Bot' logic.
+        Ensures no positions remain open outside the designated funding window (xx:59 - xx:00:30).
+        """
+        now = datetime.now()
+        minute = now.minute
+        second = now.second
+
+        # Safe Zones: 59 (Pre-Funding), 00:00-00:30 (Funding + Buffer)
+        # Kill Zone: All others
+        if minute == 59:
+            return
+        if minute == 0 and second < 30:
+            return
+
+        # Check for stray positions
+        for p in self.real_positions:
+            symbol = p["symbol"]
+            amt = float(p["positionAmt"])
+
+            if amt == 0:
+                continue
+            if symbol in self.pending_orders:
+                continue  # Don't kill if we are already working on it
+
+            # KILL IT
+            self.interface.notify(
+                f"SAFETY: Killing stray position {symbol} ({amt})", severity="warning"
+            )
+            self.pending_orders.add(symbol)  # Lock it
+
+            direction = "SHORT" if amt < 0 else "LONG"
+            close_side = "BUY" if amt < 0 else "SELL"
+            qty = abs(amt)
+
+            # Define callbacks
+            def _on_success(fill, avg, oid):
+                self.interface.notify(
+                    f"SAFETY: Killed {symbol} @ {avg}", severity="warning"
+                )
+                self.remove_pending(symbol)
+                # Also try to find and close any matching local strategy to keep UI in sync
+                found = False
+                for s in self.active_strategies:
+                    if s["symbol"] == symbol and s["status"] != "CLOSED":
+                        s["status"] = "CLOSED"
+                        s["exit_price"] = avg
+                        s["exit_time"] = time.time()
+                        s["reason"] = "Safety Kill"
+                        s["net_pnl_amt"] = (
+                            (avg - s["entry_price"]) * s["quantity"]
+                            if s["direction"] == "LONG"
+                            else (s["entry_price"] - avg) * s["quantity"]
+                        )
+                        self.closed_strategies.append(s)
+                        found = True
+                if found:
+                    self.active_strategies = [
+                        s for s in self.active_strategies if s["status"] != "CLOSED"
+                    ]
+                
+                self.sync_balance_positions()
+
+            def _on_fail(err):
+                self.interface.notify(
+                    f"SAFETY: Kill failed for {symbol}: {err}", severity="error"
+                )
+                self.remove_pending(symbol)
+
+            # Determine Position Side (Hedge Mode Support)
+            # If closing a SHORT (amt < 0), pos side is SHORT.
+            position_side = direction if self.is_hedge_mode else None
+
+            # Use smart_execute aggressive
+            self.interface.run_worker(
+                self.smart_execute(
+                    symbol,
+                    close_side,
+                    qty,
+                    aggressive=True,
+                    on_success=_on_success,
+                    on_fail=_on_fail,
+                    position_side=position_side,
+                )
+            )
 
     def fetch_premiums(self):
         self.interface.run_worker(self.fetch_premiums_worker)
@@ -203,7 +291,9 @@ class FundingLogic:
     def fetch_premiums_worker(self):
         try:
             # self.interface.call_from_thread(self.interface.log_message, "Fetching premiums...")
-            resp = requests.get(f"{BASE_URL}/fapi/v3/premiumIndex", timeout=10)
+            resp = self.exchange.session.get(
+                f"{self.exchange.base_url}/fapi/v3/premiumIndex", timeout=10
+            )
             if resp.status_code == 200:
                 self.interface.call_from_thread(self.process_premiums, resp.json())
             else:
@@ -220,7 +310,9 @@ class FundingLogic:
         self.is_fetching_tickers = True
         try:
             # self.interface.call_from_thread(self.interface.log_message, "Fetching tickers...")
-            resp = requests.get(f"{BASE_URL}/fapi/v3/ticker/bookTicker", timeout=10)
+            resp = self.exchange.session.get(
+                f"{self.exchange.base_url}/fapi/v3/ticker/bookTicker", timeout=10
+            )
             if resp.status_code == 200:
                 self.interface.call_from_thread(self.process_tickers, resp.json())
             else:
@@ -236,7 +328,9 @@ class FundingLogic:
 
     def fetch_24hr_stats_worker(self):
         try:
-            resp = requests.get(f"{BASE_URL}/fapi/v3/ticker/24hr", timeout=10)
+            resp = self.exchange.session.get(
+                f"{self.exchange.base_url}/fapi/v3/ticker/24hr", timeout=10
+            )
             if resp.status_code == 200:
                 self.interface.call_from_thread(self.process_24hr_stats, resp.json())
         except:
@@ -250,8 +344,10 @@ class FundingLogic:
                 params = {"symbol": symbol}
                 query = self.exchange._sign_request(params)
                 # headers = {'X-MBX-APIKEY': API_KEY}
-                resp = requests.get(
-                    f"{BASE_URL}/fapi/v3/commissionRate", params=query, timeout=5
+                resp = self.exchange.session.get(
+                    f"{self.exchange.base_url}/fapi/v3/commissionRate",
+                    params=query,
+                    timeout=5,
                 )
                 if resp.status_code == 200:
                     d = resp.json()
@@ -267,6 +363,8 @@ class FundingLogic:
         return _work
 
     def process_tickers(self, data):
+        if not isinstance(data, list):
+            return
         for t in data:
             self.ticker_map[t["symbol"]] = {
                 "bid": float(t.get("bidPrice", 0)),
@@ -275,6 +373,8 @@ class FundingLogic:
         self.interface.update_ui()
 
     def process_24hr_stats(self, data):
+        if not isinstance(data, list):
+            return
         for t in data:
             self.ticker_stats_cache[t["symbol"]] = {
                 "quoteVolume": float(t.get("quoteVolume", 0))
@@ -284,6 +384,9 @@ class FundingLogic:
         self.fee_cache[symbol] = {"maker": maker, "taker": taker}
 
     def process_premiums(self, data):
+        if not isinstance(data, list):
+            return
+
         candidates = []
         for p in data:
             sym = p["symbol"]
@@ -293,40 +396,55 @@ class FundingLogic:
             except:
                 continue
 
-            if abs(rate) > (DEFAULT_MAKER * 2 + MIN_PROFIT_BUFFER):
-                tik = self.ticker_map.get(sym)
-                if tik and tik["ask"] > 0:
-                    spread = (tik["ask"] - tik["bid"]) / tik["ask"]
-                    fees = self.fee_cache.get(
-                        sym, {"maker": DEFAULT_MAKER, "taker": DEFAULT_TAKER}
-                    )
+            # 1. Early Fee Fetching
+            # Queue fee fetch for anything with decent funding, so we learn real rates.
+            if abs(rate) > 0.0004 and sym not in self.fee_cache and sym not in self.fee_queue:
+                self.fee_queue.add(sym)
 
-                    if spread > 0.005:
-                        self.log_decision(
-                            sym, "SCAN", "SKIP", f"High Spread {spread:.4f}"
-                        )
-                        continue  # Spread too high
+            # 2. Basic Rate Threshold (Using Taker Fees for safety)
+            # STRADDLE strategy uses Taker orders.
+            fees = self.fee_cache.get(sym, {"maker": DEFAULT_MAKER, "taker": DEFAULT_TAKER})
 
-                    est_profit = abs(rate) - (fees["taker"] * 2)
-                    if spread > est_profit:
-                        self.log_decision(
-                            sym,
-                            "SCAN",
-                            "SKIP",
-                            f"Spread > Profit ({spread:.4f} > {est_profit:.4f})",
-                        )
-                        continue
+            # Cost = Entry Fee + Exit Fee.
+            # We assume Taker for both to be safe during filtering.
+            fee_cost = fees["taker"] * 2
 
-                if sym not in self.fee_cache and sym not in self.fee_queue:
-                    self.fee_queue.add(sym)
-                candidates.append(
-                    {
-                        "symbol": sym,
-                        "funding_rate": rate,
-                        "next_funding_time": nxt,
-                        "direction": "SHORT" if rate > 0 else "LONG",
-                    }
-                )
+            if abs(rate) <= (fee_cost + MIN_PROFIT_BUFFER):
+                continue
+
+            # 3. Ticker Data & Spread Check
+            tik = self.ticker_map.get(sym)
+            if not tik or tik["ask"] <= 0:
+                continue  # Skip if no live price data
+
+            spread = (tik["ask"] - tik["bid"]) / tik["ask"]
+
+            # 4. Volume Check
+            stats = self.ticker_stats_cache.get(sym)
+            if not stats or stats["quoteVolume"] < 500000:  # 500k Min Volume
+                continue
+
+            if spread > 0.005:
+                # self.log_decision(sym, "SCAN", "SKIP", f"High Spread {spread:.4f}")
+                continue
+
+            # 5. Net Profitability (Rate - Fees - Spread)
+            # We treat Spread as a cost (slippage).
+            est_profit = abs(rate) - fee_cost
+            net_yield = est_profit - spread
+
+            if net_yield < MIN_PROFIT_BUFFER:
+                # self.log_decision(sym, "SCAN", "SKIP", f"Low Net Yield ({net_yield:.5f} < {MIN_PROFIT_BUFFER})")
+                continue
+
+            candidates.append(
+                {
+                    "symbol": sym,
+                    "funding_rate": rate,
+                    "next_funding_time": nxt,
+                    "direction": "SHORT" if rate > 0 else "LONG",
+                }
+            )
 
         candidates.sort(key=lambda x: abs(x["funding_rate"]), reverse=True)
         self.viable_pairs = candidates
@@ -353,15 +471,46 @@ class FundingLogic:
             self.pending_orders.remove(symbol)
 
     def smart_execute(
-        self, symbol, side, qty, aggressive, on_success, on_fail, position_side=None
+        self,
+        symbol,
+        side,
+        qty,
+        aggressive,
+        on_success,
+        on_fail,
+        position_side=None,
+        switch_mode_time=None,
+        leverage=None,
     ):
         def _worker():
             order_id = None
+            cumulative_filled = 0.0
+            qty_left = qty
+
             try:
+                # Set Leverage if requested
+                if leverage is not None:
+                    self.interface.log_message(f"Setting leverage for {symbol} to {leverage}x")
+                    self.exchange.set_leverage(symbol, leverage)
+
                 start_time = time.time()
 
-                # Loop for chasing (max 30s)
-                while (time.time() - start_time) < 30:
+                # Loop for chasing (max 70s to allow for the 60s window + buffer)
+                while (time.time() - start_time) < 70:
+                    # 1. Check for Aggressive Switch
+                    if (
+                        not aggressive
+                        and switch_mode_time
+                        and time.time() >= switch_mode_time
+                    ):
+                        aggressive = True
+                        # If we have an active passive order, we need to cancel it first to go aggressive
+                        if order_id:
+                            # The cancellation logic below will handle it in the next loop iteration
+                            # But we can force a 'continue' by ensuring we don't sleep too long
+                            pass
+
+                    # 2. Fetch Price
                     ticker = self.exchange.get_book_ticker(symbol)
                     if not ticker:
                         time.sleep(1)
@@ -370,22 +519,31 @@ class FundingLogic:
                     best_bid = float(ticker["bidPrice"])
                     best_ask = float(ticker["askPrice"])
 
-                    # Target Price
+                    # 3. Determine Price based on Mode
                     if aggressive:
-                        # Marketable Limit: Buy at Ask+1%, Sell at Bid-1% (Reduced from 2% to avoid price filters)
+                        # Marketable Limit: Buy at Ask+1%, Sell at Bid-1%
                         price = best_ask * 1.01 if side == "BUY" else best_bid * 0.99
                         time_in_force = "GTC"
                     else:
-                        # Chase: Buy at Bid, Sell at Ask
+                        # Chase: Buy at Bid, Sell at Ask (Passive)
                         price = best_bid if side == "BUY" else best_ask
                         time_in_force = "GTC"
 
+                    # 4. Place Order if None exists
                     if not order_id:
+                        # Safety check on Min Qty (approx 5 USDT)
+                        if (qty_left * price) < 5.5:
+                            # Remainder too small, assume done
+                            self.interface.call_from_thread(
+                                on_success, cumulative_filled, price, "Partial-Done"
+                            )
+                            return
+
                         resp = self.exchange.place_order(
                             symbol,
                             side,
                             "LIMIT",
-                            qty,
+                            qty_left,
                             price,
                             time_in_force,
                             position_side=position_side,
@@ -399,14 +557,13 @@ class FundingLogic:
                                 side,
                                 "LIMIT",
                                 price,
-                                qty,
+                                qty_left,
                                 "NEW",
                                 0,
                                 0,
-                                "Placed",
+                                f"Placed ({'Agg' if aggressive else 'Pas'})",
                             )
                             if aggressive:
-                                # Assume filled for dry run or wait short for agg
                                 time.sleep(0.5)
                         else:
                             self.interface.call_from_thread(
@@ -419,18 +576,23 @@ class FundingLogic:
                             time.sleep(1)
                             continue
 
-                    # Check Status
+                    # 5. Check Status
                     status = self.exchange.get_order(symbol, order_id)
                     if status:
                         s = status["status"]
-                        filled = float(status.get("executedQty", 0))
+                        # 'executedQty' is cumulative for *this* order_id
+                        this_order_filled = float(status.get("executedQty", 0))
 
-                        if s == "FILLED" or (s == "CANCELED" and filled >= qty * 0.99):
+                        # Done?
+                        if s == "FILLED" or (
+                            s == "CANCELED" and this_order_filled >= qty_left * 0.99
+                        ):
+                            cumulative_filled += this_order_filled
                             avg = float(status.get("avgPrice", price))
-                            if avg == 0 and filled > 0:
-                                avg = float(status.get("cumQuote", 0)) / filled
-                            if avg == 0:
-                                avg = price  # Fallback
+                            if avg == 0 and this_order_filled > 0:
+                                avg = (
+                                    float(status.get("cumQuote", 0)) / this_order_filled
+                                )
 
                             self.interface.call_from_thread(
                                 self.log_order_event,
@@ -439,64 +601,64 @@ class FundingLogic:
                                 side,
                                 "LIMIT",
                                 price,
-                                qty,
+                                qty_left,
                                 s,
-                                filled,
+                                this_order_filled,
                                 avg,
                                 "Done",
                             )
                             self.interface.call_from_thread(
-                                on_success, filled, avg, order_id
+                                on_success, cumulative_filled, avg, order_id
                             )
                             return
 
-                        # Logic for Chase Update
-                        if not aggressive:
+                        # Logic for Chase / Reprice
+                        should_cancel = False
+
+                        # A: Switch to Aggressive?
+                        if (
+                            not aggressive
+                            and switch_mode_time
+                            and time.time() >= switch_mode_time
+                        ):
+                            should_cancel = True
+
+                        # B: Passive Reprice?
+                        elif not aggressive:
                             current_p = float(status["price"])
-                            # Check if price moved
                             new_target = best_bid if side == "BUY" else best_ask
+                            # If price moved away from our limit
+                            if (side == "BUY" and new_target > current_p) or (
+                                side == "SELL" and new_target < current_p
+                            ):
+                                should_cancel = True
 
-                            reprice = False
-                            if side == "BUY" and new_target > current_p:
-                                reprice = True
-                            if side == "SELL" and new_target < current_p:
-                                reprice = True
+                        if should_cancel:
+                            self.interface.call_from_thread(
+                                self.log_order_event,
+                                symbol,
+                                order_id,
+                                side,
+                                "LIMIT",
+                                0,  # price irrelevant here
+                                qty_left,
+                                "CANCEL_REPRICE",
+                                this_order_filled,
+                                0,
+                                "Reprice/Switch",
+                            )
+                            self.exchange.cancel_order(symbol, order_id)
 
-                            if reprice:
-                                self.interface.call_from_thread(
-                                    self.log_order_event,
-                                    symbol,
-                                    order_id,
-                                    side,
-                                    "LIMIT",
-                                    current_p,
-                                    qty,
-                                    "CANCEL_REPRICE",
-                                    filled,
-                                    0,
-                                    f"Reprice to {new_target}",
-                                )
-                                self.exchange.cancel_order(symbol, order_id)
-                                order_id = None
-                                continue
+                            # Update State for next loop
+                            cumulative_filled += this_order_filled
+                            qty_left -= this_order_filled
+                            order_id = None
+                            continue
 
                     time.sleep(1)
 
                 # Timeout / Cleanup
                 if order_id:
-                    self.interface.call_from_thread(
-                        self.log_order_event,
-                        symbol,
-                        order_id,
-                        side,
-                        "LIMIT",
-                        0,
-                        qty,
-                        "TIMEOUT_CANCEL",
-                        0,
-                        0,
-                        "Timeout",
-                    )
                     self.exchange.cancel_order(symbol, order_id)
                 self.interface.call_from_thread(on_fail, "Timeout")
 
@@ -507,7 +669,9 @@ class FundingLogic:
 
         return _worker
 
-    def execute_strategy_entry(self, strategy, symbol, direction, maker=False):
+    def execute_strategy_entry(
+        self, strategy, symbol, direction, maker=False, funding_time_ms=None
+    ):
         # Check duplicates
         for s in self.active_strategies:
             if (
@@ -542,6 +706,13 @@ class FundingLogic:
         # Determine Position Side (Hedge Mode Support)
         position_side = direction if self.is_hedge_mode else None
 
+        # Calculate Switch Time (T-29s)
+        switch_ts = None
+        if funding_time_ms:
+            # Funding time is in MS
+            funding_ts = funding_time_ms / 1000.0
+            switch_ts = funding_ts - 29.0
+
         def _on_success(fill_qty, avg_price, oid):
             s = {
                 "id": self.sim_counter,
@@ -551,6 +722,7 @@ class FundingLogic:
                 "direction": direction,
                 "entry_price": avg_price,
                 "entry_time": time.time(),
+                "funding_time": funding_time_ms / 1000.0 if funding_time_ms else 0,
                 "quantity": fill_qty,
                 "margin": self.trade_size,
                 "order_id": oid,
@@ -563,18 +735,18 @@ class FundingLogic:
         def _on_fail(reason):
             self.interface.notify(f"OPEN FAIL {symbol}: {reason}")
 
-        self.interface.notify(
-            f"CHASING ENTRY {symbol} ({'Agg' if not maker else 'Pas'})..."
-        )
+        self.interface.notify(f"ENTRY {symbol}: Passive first, Aggressive @ T-29s")
         self.interface.run_worker(
             self.smart_execute(
                 symbol,
                 side,
                 qty,
-                not maker,
-                _on_success,
-                _on_fail,
+                aggressive=False,  # Start Passive
+                on_success=_on_success,
+                on_fail=_on_fail,
                 position_side=position_side,
+                switch_mode_time=switch_ts,
+                leverage=1,
             )
         )
 
@@ -638,9 +810,16 @@ class FundingLogic:
             diff = funding_ts - current_time
             direction = cand["direction"]
 
-            # STRADDLE: Start 30s before funding. Market.
-            if 28 < diff <= 30:
-                self.execute_strategy_entry("STRADDLE", symbol, direction, maker=False)
+            # STRADDLE: Start 59s before funding.
+            # Passive First -> Aggressive at T-29s
+            if 29 < diff <= 60:
+                self.execute_strategy_entry(
+                    "STRADDLE",
+                    symbol,
+                    direction,
+                    maker=False,
+                    funding_time_ms=cand["next_funding_time"],
+                )
 
         # EXIT LOGIC
         for s in list(self.active_strategies):
@@ -694,12 +873,14 @@ class FundingLogic:
                 )
 
             # Time-based Exit
-            elif cand:
-                funding_ts = float(cand["next_funding_time"]) / 1000
-                diff = funding_ts - current_time
-
-                if strategy == "STRADDLE" and (current_time - s["entry_time"]) > 65:
-                    self.execute_strategy_exit(s, "Time Exit", maker=True)
+            # Exit passively 1s after funding.
+            # If we fail, killer_bot (running in parallel) will sweep us at T+60s.
+            elif strategy == "STRADDLE":
+                funding_time = s.get("funding_time", 0)
+                if funding_time > 0:
+                    time_since_funding = current_time - funding_time
+                    if time_since_funding > 1.0:
+                        self.execute_strategy_exit(s, "Post-Funding Exit", maker=True)
 
         self.interface.update_ui()
 
@@ -905,24 +1086,10 @@ if __name__ == "__main__":
         BASE_URL = "https://fapi.asterdex-testnet.com"
         print("WARNING: Using Testnet")
 
-    killer_process = None
     try:
         # Ensure logs directory exists
         if not os.path.exists("logs"):
             os.makedirs("logs")
-
-        # Launch killer_bot.py in the background
-        # We always run it headless to avoid TUI conflicts with the main bot
-        cmd = [sys.executable, "killer_bot.py", "--headless"]
-
-        print(
-            f"[{datetime.now().strftime('%H:%M:%S')}] Launching Companion: killer_bot.py..."
-        )
-
-        # Open log file for the background process
-        with open("logs/killer_bot.log", "a") as log_file:
-            log_file.write(f"\n[{datetime.now()}] STARTING KILLER BOT SESSION\n")
-            killer_process = subprocess.Popen(cmd, stdout=log_file, stderr=log_file)
 
         if args.headless:
             HeadlessInterface().run()
@@ -931,13 +1098,4 @@ if __name__ == "__main__":
             app.run()
 
     finally:
-        # Ensure killer bot is terminated when we exit
-        if killer_process:
-            print(
-                f"\n[{datetime.now().strftime('%H:%M:%S')}] Terminating Companion: killer_bot.py..."
-            )
-            killer_process.terminate()
-            try:
-                killer_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                killer_process.kill()
+        pass

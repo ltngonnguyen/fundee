@@ -290,3 +290,23 @@ class ExchangeInterface:
                 return resp.json()
         except: pass
         return None
+
+    def set_leverage(self, symbol, leverage):
+        if not API_SECRET: return None
+        try:
+            params = {
+                'symbol': symbol,
+                'leverage': int(leverage)
+            }
+            query = self._sign_request(params)
+            headers = {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'User-Agent': 'PythonApp/1.0',
+                'X-MBX-APIKEY': API_KEY
+            }
+            # The docs say /fapi/v1/leverage
+            resp = self.session.post(f"{self.base_url}/fapi/v1/leverage", data=query, headers=headers, timeout=10)
+            return resp.json()
+        except Exception as e:
+            self.log(f"Set leverage failed: {e}")
+            return None
