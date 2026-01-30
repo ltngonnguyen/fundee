@@ -60,6 +60,7 @@ class FundingLogic:
         self.fee_queue = set()
         self.pending_orders = set()
         self.is_hedge_mode = False  # Default One-Way
+        self.is_fetching_tickers = False # Prevent stacking requests
         
         # Track local strategy state
         self.active_strategies = [] 
@@ -154,7 +155,10 @@ class FundingLogic:
         self.interface.update_ui()
 
     def fetch_premiums(self): self.interface.run_worker(self.fetch_premiums_worker)
-    def fetch_tickers(self): self.interface.run_worker(self.fetch_tickers_worker)
+    def fetch_tickers(self): 
+        if not self.is_fetching_tickers:
+            self.interface.run_worker(self.fetch_tickers_worker)
+
     def fetch_24hr_stats(self): self.interface.run_worker(self.fetch_24hr_stats_worker)
     
     def process_fee_queue(self):
@@ -172,17 +176,20 @@ class FundingLogic:
              self.interface.call_from_thread(self.interface.log_message, f"Premium fetch error: {e}")
 
     def fetch_tickers_worker(self):
+        self.is_fetching_tickers = True
         try:
             # self.interface.call_from_thread(self.interface.log_message, "Fetching tickers...")
-            resp = requests.get(f"{BASE_URL}/fapi/v1/ticker/bookTicker", timeout=5)
+            resp = requests.get(f"{BASE_URL}/fapi/v3/ticker/bookTicker", timeout=10)
             if resp.status_code == 200: self.interface.call_from_thread(self.process_tickers, resp.json())
             else: self.interface.call_from_thread(self.interface.log_message, f"Ticker fail: {resp.status_code}")
         except Exception as e:
             self.interface.call_from_thread(self.interface.log_message, f"Ticker error: {e}")
+        finally:
+            self.is_fetching_tickers = False
 
     def fetch_24hr_stats_worker(self):
         try:
-            resp = requests.get(f"{BASE_URL}/fapi/v1/ticker/24hr", timeout=10)
+            resp = requests.get(f"{BASE_URL}/fapi/v3/ticker/24hr", timeout=10)
             if resp.status_code == 200: self.interface.call_from_thread(self.process_24hr_stats, resp.json())
         except: pass
 
@@ -648,6 +655,10 @@ if __name__ == "__main__":
 
     killer_process = None
     try:
+        # Ensure logs directory exists
+        if not os.path.exists("logs"):
+            os.makedirs("logs")
+
         # Launch killer_bot.py in the background
         # We always run it headless to avoid TUI conflicts with the main bot
         cmd = [sys.executable, "killer_bot.py", "--headless"]

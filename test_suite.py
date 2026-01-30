@@ -12,14 +12,14 @@ class TestFundingApp(unittest.TestCase):
         self.base_url = BASE_URL
 
     def test_01_public_exchange_info(self):
-        """Test public endpoint: Exchange Info (v1)"""
+        """Test public endpoint: Exchange Info (v3)"""
         print(f"\n[TEST] Exchange Info on {self.base_url}...")
         self.exchange.load_exchange_info()
         self.assertTrue(len(self.exchange.precision_map) > 0, "Failed to load exchange info")
         print(f" -> Loaded {len(self.exchange.precision_map)} symbols.")
 
     def test_02_public_book_ticker(self):
-        """Test public endpoint: Book Ticker (v1)"""
+        """Test public endpoint: Book Ticker (v3)"""
         print("\n[TEST] Book Ticker...")
         ticker = self.exchange.get_book_ticker("BTCUSDT")
         if ticker:

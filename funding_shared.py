@@ -29,6 +29,7 @@ class ExchangeInterface:
         self.base_url = base_url or BASE_URL
         self.logger = logger
         self.precision_map = {}
+        self.session = requests.Session()
         self.load_exchange_info()
     
     def log(self, msg):
@@ -39,7 +40,7 @@ class ExchangeInterface:
 
     def load_exchange_info(self):
         try:
-            resp = requests.get(f"{self.base_url}/fapi/v1/exchangeInfo", timeout=10)
+            resp = self.session.get(f"{self.base_url}/fapi/v3/exchangeInfo", timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
                 for s in data['symbols']:
@@ -149,7 +150,7 @@ class ExchangeInterface:
             query = self._sign_request(params)
             headers = {'User-Agent': 'PythonApp/1.0'}
             # Try v3 balance
-            resp = requests.get(f"{self.base_url}/fapi/v3/balance", params=query, headers=headers, timeout=5)
+            resp = self.session.get(f"{self.base_url}/fapi/v3/balance", params=query, headers=headers, timeout=10)
             if resp.status_code == 200:
                 for b in resp.json():
                     if b['asset'] == 'USDT':
@@ -167,7 +168,7 @@ class ExchangeInterface:
             params = {}
             query = self._sign_request(params)
             headers = {'User-Agent': 'PythonApp/1.0'}
-            resp = requests.get(f"{self.base_url}/fapi/v3/positionRisk", params=query, headers=headers, timeout=5)
+            resp = self.session.get(f"{self.base_url}/fapi/v3/positionRisk", params=query, headers=headers, timeout=10)
             if resp.status_code == 200:
                 # Return only active positions
                 return [p for p in resp.json() if float(p['positionAmt']) != 0]
@@ -187,7 +188,7 @@ class ExchangeInterface:
                     'User-Agent': 'PythonApp/1.0',
                     'X-MBX-APIKEY': API_KEY
                 }
-                resp = requests.get(f"{self.base_url}/fapi/v3/positionSide/dual", params=query, headers=headers, timeout=5)
+                resp = self.session.get(f"{self.base_url}/fapi/v3/positionSide/dual", params=query, headers=headers, timeout=10)
                 if resp.status_code == 200:
                     data = resp.json()
                     val = data.get('dualSidePosition')
@@ -208,7 +209,7 @@ class ExchangeInterface:
                 'User-Agent': 'PythonApp/1.0',
                 'X-MBX-APIKEY': API_KEY
             }
-            resp = requests.get(f"{self.base_url}/fapi/v3/positionRisk", params=query, headers=headers, timeout=5)
+            resp = self.session.get(f"{self.base_url}/fapi/v3/positionRisk", params=query, headers=headers, timeout=10)
             if resp.status_code == 200:
                 return resp.json()
             else:
@@ -247,7 +248,7 @@ class ExchangeInterface:
                 'User-Agent': 'PythonApp/1.0',
                 'X-MBX-APIKEY': API_KEY
             }
-            resp = requests.post(f"{self.base_url}/fapi/v3/order", data=query, headers=headers, timeout=5)
+            resp = self.session.post(f"{self.base_url}/fapi/v3/order", data=query, headers=headers, timeout=10)
             return resp.json()
         except Exception as e:
             self.log(f"Order failed: {e}")
@@ -259,7 +260,7 @@ class ExchangeInterface:
             params = {'symbol': symbol, 'orderId': order_id}
             query = self._sign_request(params)
             headers = {'User-Agent': 'PythonApp/1.0'}
-            resp = requests.delete(f"{self.base_url}/fapi/v3/order", data=query, headers=headers, timeout=5)
+            resp = self.session.delete(f"{self.base_url}/fapi/v3/order", data=query, headers=headers, timeout=10)
             return resp.json()
         except Exception as e:
             self.log(f"Cancel failed: {e}")
@@ -271,13 +272,13 @@ class ExchangeInterface:
             params = {'symbol': symbol, 'orderId': order_id}
             query = self._sign_request(params)
             headers = {'User-Agent': 'PythonApp/1.0'}
-            resp = requests.get(f"{self.base_url}/fapi/v3/order", params=query, headers=headers, timeout=5)
+            resp = self.session.get(f"{self.base_url}/fapi/v3/order", params=query, headers=headers, timeout=10)
             return resp.json()
         except: return None
 
     def get_book_ticker(self, symbol):
         try:
-            resp = requests.get(f"{self.base_url}/fapi/v1/ticker/bookTicker", params={'symbol': symbol}, timeout=5)
+            resp = self.session.get(f"{self.base_url}/fapi/v3/ticker/bookTicker", params={'symbol': symbol}, timeout=10)
             if resp.status_code == 200:
                 return resp.json()
         except: pass
