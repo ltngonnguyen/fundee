@@ -7,7 +7,7 @@ Type=simple
 EnvironmentFile=/home/johnd/funding-hybrid/.env
 User=johnd
 WorkingDirectory=/home/johnd/funding-hybrid
-ExecStart=/usr/bin/python3 /home/johnd/funding-hybrid/funding_bot_real.py --headless
+ExecStart=/home/johnd/funding-hybrid/venv/bin/python /home/johnd/funding-hybrid/funding_bot_real.py --headless
 Restart=always
 RestartSec=5
 
