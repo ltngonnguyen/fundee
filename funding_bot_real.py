@@ -38,13 +38,11 @@ except ImportError:
 # ==========================================
 # CONFIGURATION
 # ==========================================
-MAINNET_URL = "https://fapi.asterdex.com"
-TESTNET_URL = "https://fapi.asterdex-testnet.com"
+BASE_URL = "https://fapi.asterdex.com"
 
 # REAL TRADING CONFIG
-DRY_RUN = True  # Set to False to enable real orders
+DRY_RUN = False  # Set to True for simulation (if implemented), but we default to real orders now
 
-BASE_URL = TESTNET_URL if DRY_RUN else MAINNET_URL
 API_KEY = os.getenv('ASTER_API_KEY')
 API_SECRET = os.getenv('ASTER_API_SECRET')
 USER_ADDRESS = os.getenv('ASTER_USER_ADDRESS')
@@ -99,7 +97,10 @@ class ExchangeInterface:
         precision = p_info['qty_precision']
         if step_size == 0: return round(qty, precision)
         # Use floor to avoid exceeding balance/limits
-        return round(math.floor(qty / step_size) * step_size, precision)
+        normalized = round(math.floor(qty / step_size) * step_size, precision)
+        if normalized <= 0 and qty > 0:
+             self.log(f"Quantity {qty} too small for symbol {symbol}. Step size: {step_size}")
+        return normalized
 
     def _trim_dict(self, data):
         for key in data:
@@ -201,13 +202,55 @@ class ExchangeInterface:
              self.log(f"Pos Exception: {e}")
         return []
 
-    def place_order(self, symbol, side, type, quantity, price=None, time_in_force="GTC"):
+    def get_position_mode(self):
+        try:
+            params = {}
+            if API_SECRET:
+                # GET /fapi/v3/positionSide/dual requires auth
+                query = self._sign_request(params)
+                headers = {
+                    'User-Agent': 'PythonApp/1.0',
+                    'X-MBX-APIKEY': API_KEY
+                }
+                resp = requests.get(f"{BASE_URL}/fapi/v3/positionSide/dual", params=query, headers=headers, timeout=5)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    val = data.get('dualSidePosition')
+                    if str(val).lower() == 'true': return True
+                    return False
+                else:
+                    self.log(f"Position Mode Failed: {resp.status_code} {resp.text}")
+        except Exception as e:
+            self.log(f"Error checking position mode: {e}")
+        return False # Default to One-way
+
+    def get_position_risk(self, symbol):
+        if not API_SECRET: return None
+        try:
+            params = {'symbol': symbol}
+            query = self._sign_request(params)
+            headers = {
+                'User-Agent': 'PythonApp/1.0',
+                'X-MBX-APIKEY': API_KEY
+            }
+            resp = requests.get(f"{BASE_URL}/fapi/v3/positionRisk", params=query, headers=headers, timeout=5)
+            if resp.status_code == 200:
+                return resp.json()
+            else:
+                self.log(f"Position Risk Failed: {resp.status_code} {resp.text}")
+        except Exception as e:
+            self.log(f"Error checking position risk: {e}")
+        return None
+
+    def place_order(self, symbol, side, type, quantity, price=None, time_in_force="GTC", position_side=None):
         # if DRY_RUN: ... (Removed for Testnet usage)
         
         if not API_SECRET: return None
         
         qty = self.normalize_quantity(symbol, quantity)
-        if qty <= 0: return None
+        if qty <= 0: 
+            self.log(f"Invalid Quantity: {qty}")
+            return None
 
         params = {
             'symbol': symbol,
@@ -215,6 +258,9 @@ class ExchangeInterface:
             'type': type,
             'quantity': qty,
         }
+        
+        if position_side:
+            params['positionSide'] = position_side
         
         if type == 'LIMIT':
             if price is None: return None
@@ -225,7 +271,8 @@ class ExchangeInterface:
             query = self._sign_request(params)
             headers = {
                 'Content-Type': 'application/x-www-form-urlencoded',
-                'User-Agent': 'PythonApp/1.0'
+                'User-Agent': 'PythonApp/1.0',
+                'X-MBX-APIKEY': API_KEY
             }
             resp = requests.post(f"{BASE_URL}/fapi/v3/order", data=query, headers=headers, timeout=5)
             return resp.json()
@@ -278,6 +325,7 @@ class FundingLogic:
         self.ticker_stats_cache = {}
         self.fee_queue = set()
         self.pending_orders = set()
+        self.is_hedge_mode = False  # Default One-Way
         
         # Track local strategy state
         self.active_strategies = [] 
@@ -291,6 +339,11 @@ class FundingLogic:
 
     def start(self):
         self.interface.log_message(f"Starting Logic (Base: {BASE_URL})")
+        
+        # Check Position Mode
+        self.is_hedge_mode = self.exchange.get_position_mode()
+        self.interface.log_message(f"Position Mode: {'Hedge' if self.is_hedge_mode else 'One-Way'}")
+        
         self.interface.set_interval(60.0, self.fetch_premiums)
         self.interface.set_interval(60.0, self.fetch_24hr_stats)
         self.interface.set_interval(5.0, self.sync_balance_positions) # Sync with exchange
@@ -368,7 +421,7 @@ class FundingLogic:
                 params = {'symbol': symbol}
                 query = self.exchange._sign_request(params)
                 # headers = {'X-MBX-APIKEY': API_KEY}
-                resp = requests.get(f"{BASE_URL}/fapi/v1/commissionRate", params=query, timeout=5)
+                resp = requests.get(f"{BASE_URL}/fapi/v3/commissionRate", params=query, timeout=5)
                 if resp.status_code == 200:
                     d = resp.json()
                     self.interface.call_from_thread(self.update_fee_cache, symbol, float(d.get("makerCommissionRate", DEFAULT_MAKER)), float(d.get("takerCommissionRate", DEFAULT_TAKER)))
@@ -426,7 +479,7 @@ class FundingLogic:
     def remove_pending(self, symbol):
         if symbol in self.pending_orders: self.pending_orders.remove(symbol)
 
-    def smart_execute(self, symbol, side, qty, aggressive, on_success, on_fail):
+    def smart_execute(self, symbol, side, qty, aggressive, on_success, on_fail, position_side=None):
         def _worker():
             order_id = None
             try:
@@ -444,8 +497,8 @@ class FundingLogic:
                     
                     # Target Price
                     if aggressive:
-                        # Marketable Limit: Buy at Ask+2%, Sell at Bid-2%
-                        price = best_ask * 1.02 if side == "BUY" else best_bid * 0.98
+                        # Marketable Limit: Buy at Ask+1%, Sell at Bid-1% (Reduced from 2% to avoid price filters)
+                        price = best_ask * 1.01 if side == "BUY" else best_bid * 0.99
                         time_in_force = "GTC" 
                     else:
                         # Chase: Buy at Bid, Sell at Ask
@@ -453,7 +506,7 @@ class FundingLogic:
                         time_in_force = "GTC"
                     
                     if not order_id:
-                        resp = self.exchange.place_order(symbol, side, "LIMIT", qty, price, time_in_force)
+                        resp = self.exchange.place_order(symbol, side, "LIMIT", qty, price, time_in_force, position_side=position_side)
                         if resp and 'orderId' in resp:
                             order_id = resp.get('orderId')
                             if aggressive: 
@@ -526,6 +579,9 @@ class FundingLogic:
         qty = self.trade_size / price
         side = "BUY" if direction == "LONG" else "SELL"
         
+        # Determine Position Side (Hedge Mode Support)
+        position_side = direction if self.is_hedge_mode else None
+        
         def _on_success(fill_qty, avg_price, oid):
              s = {
                 'id': self.sim_counter,
@@ -549,7 +605,7 @@ class FundingLogic:
 
         self.interface.notify(f"CHASING ENTRY {symbol} ({'Agg' if not maker else 'Pas'})...")
         self.interface.run_worker(
-            self.smart_execute(symbol, side, qty, not maker, _on_success, _on_fail)
+            self.smart_execute(symbol, side, qty, not maker, _on_success, _on_fail, position_side=position_side)
         )
 
     def execute_strategy_exit(self, s, reason, maker=False):
@@ -557,6 +613,9 @@ class FundingLogic:
         self.pending_orders.add(s['symbol'])
         
         side = "SELL" if s['direction'] == "LONG" else "BUY"
+        
+        # Determine Position Side (Hedge Mode Support)
+        position_side = s['direction'] if self.is_hedge_mode else None
         
         def _on_success(fill_qty, avg_price, oid):
             s['status'] = 'CLOSED'
@@ -582,7 +641,7 @@ class FundingLogic:
 
         self.interface.notify(f"CLOSING {s['strategy']} {s['symbol']} ({reason})...")
         self.interface.run_worker(
-            self.smart_execute(s['symbol'], side, s['quantity'], not maker, _on_success, _on_fail)
+            self.smart_execute(s['symbol'], side, s['quantity'], not maker, _on_success, _on_fail, position_side=position_side)
         )
 
     def update_strategies(self):
@@ -679,7 +738,7 @@ class HeadlessInterface:
         
     def run(self):
         self.logic = FundingLogic(self)
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting REAL TRADING Bot (Dry Run: {DRY_RUN})...")
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting REAL TRADING Bot (LIVE Mode)...")
         self.logic.start()
         
         try:
@@ -720,7 +779,7 @@ class FundingApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        yield Static(f"REAL TRADING (Dry Run: {DRY_RUN}) | Balance: ...", id="balance_display", classes="section_title")
+        yield Static(f"REAL TRADING (LIVE MODE) | Balance: ...", id="balance_display", classes="section_title")
         yield Vertical(
             Static("Market Scanner", classes="section_title"),
             DataTable(id="scanner_table"),
@@ -759,7 +818,7 @@ class FundingApp(App):
         super().notify(msg, title=title, severity=severity, timeout=timeout)
 
     def update_ui(self):
-        self.query_one("#balance_display", Static).update(f"REAL TRADING (Dry Run: {DRY_RUN}) | Balance: ${self.logic.balance:.2f}")
+        self.query_one("#balance_display", Static).update(f"REAL TRADING (LIVE MODE) | Balance: ${self.logic.balance:.2f}")
         self.update_scanner_table()
         self.update_sim_table()
 
@@ -796,25 +855,23 @@ class FundingApp(App):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--headless", action="store_true", help="Run in headless mode")
-    parser.add_argument("--live", action="store_true", help="DISABLE Dry Run (Real Money)")
+    parser.add_argument("--testnet", action="store_true", help="Use testnet (NOT RECOMMENDED)")
     args = parser.parse_args()
 
-    if args.live:
-        DRY_RUN = False
-        BASE_URL = MAINNET_URL
-    else:
-        DRY_RUN = True
-        BASE_URL = TESTNET_URL
+    if args.testnet:
+        BASE_URL = "https://fapi.asterdex-testnet.com"
+        print("WARNING: Using Testnet")
 
     killer_process = None
     try:
         # Launch killer_bot.py in the background
         # We always run it headless to avoid TUI conflicts with the main bot
         cmd = [sys.executable, "killer_bot.py", "--headless"]
-        if args.live:
-            cmd.append("--live")
+        if not args.testnet:
+             cmd.append("--live")
             
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Launching Companion: killer_bot.py...")
+
         
         # Open log file for the background process
         with open("killer_bot.log", "a") as log_file:

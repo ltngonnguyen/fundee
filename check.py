@@ -1,217 +1,426 @@
-import time
+import argparse
+import json
 import os
-import hmac
-import hashlib
-from urllib.parse import urlencode
-import pandas as pd
+import sys
+import time
+import math
+from datetime import datetime
 import requests
 
-# Aster Dex API Base URL
-BASE_URL = "https://fapi.asterdex.com"
+# Try imports
+try:
+    from eth_abi.abi import encode
+    from eth_account import Account
+    from eth_account.messages import encode_defunct
+    from web3 import Web3
+except ImportError:
+    print("Error: Web3 libraries not installed. Please run 'pip install web3 eth-account eth-abi'")
+    sys.exit(1)
 
-# API Credentials
+# ==========================================
+# CONFIGURATION
+# ==========================================
+MAINNET_URL = "https://fapi.asterdex.com"
+TESTNET_URL = "https://fapi.asterdex-testnet.com"
+
+# Global Config (set via args)
+BASE_URL = TESTNET_URL 
 API_KEY = os.getenv('ASTER_API_KEY')
 API_SECRET = os.getenv('ASTER_API_SECRET')
+USER_ADDRESS = os.getenv('ASTER_USER_ADDRESS')
+SIGNER_ADDRESS = os.getenv('ASTER_SIGNER_ADDRESS', USER_ADDRESS)
 
-def get_signature(params, secret):
-    """Generates HMAC SHA256 signature."""
-    query_string = urlencode(params)
-    return hmac.new(
-        secret.encode('utf-8'),
-        query_string.encode('utf-8'),
-        hashlib.sha256
-    ).hexdigest()
-
-def get_commission_rate(symbol):
-    """
-    Retrieves the commission rate for a specific symbol.
-    Endpoint: GET /fapi/v1/commissionRate
-    """
-    if not API_KEY or not API_SECRET:
-        return None
-
-    endpoint = '/fapi/v1/commissionRate'
-    url = BASE_URL + endpoint
+class ExchangeInterface:
+    def __init__(self, base_url=None):
+        self.base_url = base_url or BASE_URL
+        self.precision_map = {}
+        self.load_exchange_info()
     
-    params = {
-        'symbol': symbol,
-        'timestamp': int(time.time() * 1000),
-        'recvWindow': 5000
-    }
-    
-    params['signature'] = get_signature(params, API_SECRET)
-    
-    headers = {
-        'X-MBX-APIKEY': API_KEY,
-        'Content-Type': 'application/json'
-    }
+    def log(self, msg):
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
-    try:
-        response = requests.get(url, headers=headers, params=params)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            return None
-    except Exception:
-        return None
+    def load_exchange_info(self):
+        try:
+            resp = requests.get(f"{self.base_url}/fapi/v1/exchangeInfo", timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                for s in data['symbols']:
+                    filters = {f['filterType']: f for f in s['filters']}
+                    tick_size = float(filters['PRICE_FILTER']['tickSize']) if 'PRICE_FILTER' in filters else 0.0
+                    step_size = float(filters['LOT_SIZE']['stepSize']) if 'LOT_SIZE' in filters else 0.0
+                    self.precision_map[s['symbol']] = {
+                        'tick_size': tick_size,
+                        'step_size': step_size,
+                        'price_precision': s['pricePrecision'],
+                        'qty_precision': s['quantityPrecision']
+                    }
+        except Exception as e:
+            self.log(f"Error loading exchange info: {e}")
 
-def get_all_tickers():
-    """
-    Retrieves the book ticker for all symbols to get Bid/Ask prices.
-    Endpoint: GET /fapi/v1/ticker/bookTicker
-    """
-    url = f"{BASE_URL}/fapi/v1/ticker/bookTicker"
-    try:
-        response = requests.get(url)
-        if response.status_code == 200:
-            return response.json()
-    except Exception:
-        pass
-    return []
+    def normalize_price(self, symbol, price):
+        if symbol not in self.precision_map: return price
+        p_info = self.precision_map[symbol]
+        tick_size = p_info['tick_size']
+        precision = p_info['price_precision']
+        if tick_size == 0: return round(price, precision)
+        return round(round(price / tick_size) * tick_size, precision)
 
-def get_viable_scalps(min_profit_buffer=0.0002):
-    """
-    Finds pairs where Funding Rate > (2 * Maker Fee) + Buffer
-    min_profit_buffer: 0.0002 (0.02%) profit target per hour
-    """
-    try:
-        # 1. Get all Premium Indices (Predicted Funding)
-        premium_url = f"{BASE_URL}/fapi/v3/premiumIndex"
-        premiums = requests.get(premium_url).json()
+    def normalize_quantity(self, symbol, qty):
+        if symbol not in self.precision_map: return qty
+        p_info = self.precision_map[symbol]
+        step_size = p_info['step_size']
+        precision = p_info['qty_precision']
+        if step_size == 0: return round(qty, precision)
+        # Use floor to avoid exceeding balance/limits
+        normalized = round(math.floor(qty / step_size) * step_size, precision)
+        if normalized <= 0 and qty > 0:
+             self.log(f"Quantity {qty} too small for symbol {symbol}. Step size: {step_size}")
+        return normalized
+
+    def _trim_dict(self, data):
+        for key in data:
+            value = data[key]
+            if isinstance(value, list):
+                new_value = []
+                for item in value:
+                    if isinstance(item, dict):
+                        new_value.append(json.dumps(self._trim_dict(item)))
+                    else:
+                        new_value.append(str(item))
+                data[key] = json.dumps(new_value)
+                continue
+            if isinstance(value, dict):
+                data[key] = json.dumps(self._trim_dict(value))
+                continue
+            data[key] = str(value)
+        return data
+
+    def _sign_request(self, params):
+        if not API_SECRET: return None
         
-        # 2. Get All Book Tickers (for Spread)
-        tickers = get_all_tickers()
-        tickers_map = {t['symbol']: t for t in tickers}
+        # Filter None
+        params = {k: v for k, v in params.items() if v is not None}
+        
+        # Add required params
+        params['recvWindow'] = 50000
+        params['timestamp'] = int(time.time() * 1000)
+        
+        # Prepare for signing (convert to strings)
+        self._trim_dict(params)
+        
+        # Generate Nonce
+        nonce = int(time.time() * 1000000)
+        
+        # Generate JSON string for hashing
+        # Ensure consistent sorting and no spaces
+        json_str = json.dumps(params, sort_keys=True).replace(' ', '').replace("'", '"')
+        
+        user = USER_ADDRESS
+        signer = SIGNER_ADDRESS if SIGNER_ADDRESS else USER_ADDRESS
+        
+        # ABI Encode and Hash
+        encoded = encode(['string', 'address', 'address', 'uint256'], 
+                         [json_str, user, signer, nonce])
+        keccak_hex = Web3.keccak(encoded).hex()
+        
+        # Sign
+        signable_msg = encode_defunct(hexstr=keccak_hex)
+        signed_message = Account.sign_message(signable_message=signable_msg, private_key=API_SECRET)
+        
+        # Add Auth fields
+        params['nonce'] = nonce
+        params['user'] = user
+        params['signer'] = signer
+        params['signature'] = '0x' + signed_message.signature.hex()
+        
+        return params
 
-        viable_pairs = []
+    def place_order(self, symbol, side, type, quantity, price=None, time_in_force="GTC", position_side=None):
+        if not API_SECRET: 
+            self.log("Missing API Secret")
+            return None
+        
+        qty = self.normalize_quantity(symbol, quantity)
+        if qty <= 0: 
+            self.log(f"Invalid Quantity: {qty}")
+            return None
 
-        print(f"Scanning {len(premiums)} pairs for opportunities...")
+        params = {
+            'symbol': symbol,
+            'side': side,
+            'type': type,
+            'quantity': qty,
+        }
+        
+        if position_side:
+            params['positionSide'] = position_side
+        
+        if type == 'LIMIT':
+            if price is None: 
+                self.log("Limit order requires price")
+                return None
+            params['price'] = self.normalize_price(symbol, price)
+            params['timeInForce'] = time_in_force
 
-        # Default fees for initial filtering
-        default_maker = 0.0002
-        default_taker = 0.0004  # Assuming 0.04% default taker
+        try:
+            query = self._sign_request(params)
+            headers = {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'User-Agent': 'CheckBot/1.0',
+                'X-MBX-APIKEY': API_KEY
+            }
+            resp = requests.post(f"{self.base_url}/fapi/v3/order", data=query, headers=headers, timeout=5)
+            return resp.json()
+        except Exception as e:
+            self.log(f"Order request failed: {e}")
+            return None
 
-        for p in premiums:
-            symbol = p["symbol"]
-            
-            # Using lastFundingRate as proxy
-            try:
-                funding_rate = float(p["lastFundingRate"])
-            except (ValueError, KeyError):
+    def cancel_order(self, symbol, order_id):
+        if not API_SECRET: return None
+        try:
+            params = {'symbol': symbol, 'orderId': order_id}
+            query = self._sign_request(params)
+            headers = {
+                'User-Agent': 'CheckBot/1.0',
+                'X-MBX-APIKEY': API_KEY
+            }
+            resp = requests.delete(f"{self.base_url}/fapi/v3/order", data=query, headers=headers, timeout=5)
+            return resp.json()
+        except Exception as e:
+            self.log(f"Cancel failed: {e}")
+            return None
+
+    def get_order(self, symbol, order_id):
+        if not API_SECRET: return None
+        try:
+            params = {'symbol': symbol, 'orderId': order_id}
+            query = self._sign_request(params)
+            headers = {
+                'User-Agent': 'CheckBot/1.0',
+                'X-MBX-APIKEY': API_KEY
+            }
+            resp = requests.get(f"{self.base_url}/fapi/v3/order", params=query, headers=headers, timeout=5)
+            return resp.json()
+        except Exception as e: 
+            self.log(f"Get order failed: {e}")
+            return None
+
+    def get_book_ticker(self, symbol):
+        try:
+            resp = requests.get(f"{self.base_url}/fapi/v1/ticker/bookTicker", params={'symbol': symbol}, timeout=5)
+            if resp.status_code == 200:
+                return resp.json()
+        except: pass
+        return None
+
+    def get_position_mode(self):
+        try:
+            params = {}
+            if API_SECRET:
+                # GET /fapi/v1/positionSide/dual requires auth
+                query = self._sign_request(params)
+                headers = {
+                    'User-Agent': 'CheckBot/1.0',
+                    'X-MBX-APIKEY': API_KEY
+                }
+                resp = requests.get(f"{self.base_url}/fapi/v1/positionSide/dual", params=query, headers=headers, timeout=5)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    print(f"DEBUG: Position Mode Response: {data}")
+                    val = data.get('dualSidePosition')
+                    if str(val).lower() == 'true': return True
+                    return False
+                else:
+                    print(f"DEBUG: Position Mode Failed: {resp.status_code} {resp.text}")
+        except Exception as e:
+            self.log(f"Error checking position mode: {e}")
+        return False # Default to One-way
+
+    def get_position_risk(self, symbol):
+        if not API_SECRET: return None
+        try:
+            params = {'symbol': symbol}
+            query = self._sign_request(params)
+            headers = {
+                'User-Agent': 'CheckBot/1.0',
+                'X-MBX-APIKEY': API_KEY
+            }
+            resp = requests.get(f"{self.base_url}/fapi/v3/positionRisk", params=query, headers=headers, timeout=5)
+            if resp.status_code == 200:
+                return resp.json()
+            else:
+                print(f"DEBUG: Position Risk Failed: {resp.status_code} {resp.text}")
+        except Exception as e:
+            self.log(f"Error checking position risk: {e}")
+        return None
+
+def smart_execute_sync(exchange, symbol, side, qty, aggressive=False, position_side=None):
+    """
+    Synchronous version of smart_execute for CLI use.
+    """
+    order_id = None
+    start_time = time.time()
+    
+    print(f"--- Smart Execute: {side} {qty} {symbol} (Aggressive: {aggressive}) ---")
+    
+    try:
+        # Loop for chasing (max 30s)
+        while (time.time() - start_time) < 30:
+            ticker = exchange.get_book_ticker(symbol)
+            if not ticker: 
+                time.sleep(1)
                 continue
 
-            abs_rate = abs(funding_rate)
-            round_trip_fee = default_maker * 2
-
-            # Calculate Countdown
-            next_funding_ms = p.get("nextFundingTime")
-            countdown_str = "N/A"
-            if next_funding_ms:
-                try:
-                    delta_sec = (float(next_funding_ms) / 1000) - time.time()
-                    if delta_sec > 0:
-                        m, s = divmod(int(delta_sec), 60)
-                        h, m = divmod(m, 60)
-                        countdown_str = f"{h:02d}:{m:02d}:{s:02d}"
-                    else:
-                        countdown_str = "00:00:00"
-                except Exception:
-                    pass
-
-            # Calculate Spread
-            spread_pct = 0.0
-            ticker = tickers_map.get(symbol)
-            if ticker:
-                try:
-                    bid = float(ticker.get("bidPrice", 0))
-                    ask = float(ticker.get("askPrice", 0))
-                    if ask > 0:
-                        spread_pct = (ask - bid) / ask
-                except ValueError:
-                    pass
-
-            # Initial filter
-            if abs_rate > (round_trip_fee + min_profit_buffer):
-                direction = "SHORT" if funding_rate > 0 else "LONG"
-                net_yield = abs_rate - round_trip_fee
-
-                viable_pairs.append(
-                    {
-                        "symbol": symbol,
-                        "funding_rate": funding_rate,
-                        "direction": direction,
-                        "net_yield_est": net_yield,
-                        "countdown": countdown_str,
-                        "spread": spread_pct,
-                        # Placeholders
-                        "maker_fee": default_maker,
-                        "taker_fee": default_taker
-                    }
-                )
-
-        # Sort by estimated yield first
-        df = pd.DataFrame(viable_pairs)
-        
-        if not df.empty:
-            df = df.sort_values(by="net_yield_est", ascending=False)
+            best_bid = float(ticker['bidPrice'])
+            best_ask = float(ticker['askPrice'])
             
-            # Process top 10 for detailed fees
-            print("\nFetching real-time fees for top candidates...")
+            # Target Price
+            if aggressive:
+                # Marketable Limit: Buy at Ask+1%, Sell at Bid-1% (Reduced from 2% to avoid price filters)
+                price = best_ask * 1.01 if side == "BUY" else best_bid * 0.99
+                time_in_force = "GTC" 
+            else:
+                # Chase: Buy at Bid, Sell at Ask (Maker attempt)
+                price = best_bid if side == "BUY" else best_ask
+                time_in_force = "GTC"
             
-            # We will iterate over the indices of the top 10 rows
-            top_indices = df.head(10).index
+            if not order_id:
+                print(f"Placing initial order @ {price:.4f}...")
+                resp = exchange.place_order(symbol, side, "LIMIT", qty, price, time_in_force, position_side=position_side)
+                if resp and 'orderId' in resp:
+                    order_id = resp.get('orderId')
+                    print(f"Order placed: ID {order_id}")
+                    if aggressive: 
+                        time.sleep(0.5)
+                else:
+                    print(f"Order placement failed: {resp}")
+                    time.sleep(1)
+                    continue
             
-            for idx in top_indices:
-                symbol = df.loc[idx, "symbol"]
-                fee_data = get_commission_rate(symbol)
+            # Check Status
+            status = exchange.get_order(symbol, order_id)
+            if status:
+                s = status['status']
+                filled = float(status.get('executedQty', 0))
                 
-                if fee_data:
-                    # Parse fees (API returns strings)
-                    m_fee = float(fee_data.get("makerCommissionRate", default_maker))
-                    t_fee = float(fee_data.get("takerCommissionRate", default_taker))
-                    
-                    df.loc[idx, "maker_fee"] = m_fee
-                    df.loc[idx, "taker_fee"] = t_fee
+                if s == 'FILLED' or (s == 'CANCELED' and filled >= qty*0.99):
+                     avg = float(status.get('avgPrice', price))
+                     if avg == 0 and filled > 0: avg = float(status.get('cumQuote', 0)) / filled
+                     print(f"SUCCESS: Filled {filled} @ {avg:.4f}")
+                     return True
+                
+                # Logic for Chase Update
+                if not aggressive:
+                     current_p = float(status['price'])
+                     # Check if price moved
+                     new_target = best_bid if side == "BUY" else best_ask
+                     
+                     reprice = False
+                     # If trying to BUY, and Bid > Current Price, we are behind.
+                     if side == "BUY" and new_target > current_p: reprice = True
+                     # If trying to SELL, and Ask < Current Price, we are behind.
+                     if side == "SELL" and new_target < current_p: reprice = True
+                     
+                     if reprice:
+                         print(f"Price moved ({current_p} -> {new_target}). Repricing...")
+                         exchange.cancel_order(symbol, order_id)
+                         order_id = None 
+                         continue
+                
+                print(f"Status: {s}, Filled: {filled}/{qty}...", end='\r')
             
-            # Recalculate Earnings for the displayed rows based on specific fees
-            # We'll calculate for the whole DF but only the top ones have updated fees
-            
-            # Columns:
-            # 1. Earn (Mk/Mk): abs_funding - 2 * maker
-            # 2. Earn (Tk/Tk): abs_funding - 2 * taker - spread
-            # 3. Earn (Mix):   abs_funding - (maker + taker) - (spread / 2)
-            
-            abs_fund = df["funding_rate"].abs()
-            spread = df["spread"]
-            
-            df["Earn_MkMk"] = abs_fund - (df["maker_fee"] * 2)
-            df["Earn_TkTk"] = abs_fund - (df["taker_fee"] * 2) - spread
-            df["Earn_Mix"] = abs_fund - (df["maker_fee"] + df["taker_fee"]) - (spread / 2.0)
-
-            # Select and rename columns for display
-            display_cols = [
-                "symbol", "funding_rate", "direction", "countdown",
-                "spread", "Earn_MkMk", "Earn_TkTk", "Earn_Mix"
-            ]
-            
-            print("\n--- VIABLE HOURLY SCALPS (Top 10) ---")
-            # Format nicely
-            pd.options.display.float_format = '{:.6f}'.format
-            
-            # Format as percentages for display
-            df_display = df[display_cols].head(10).copy()
-            for col in ["funding_rate", "spread", "Earn_MkMk", "Earn_TkTk", "Earn_Mix"]:
-                df_display[col] = df_display[col].apply(lambda x: f"{x*100:.4f}%")
-            
-            print(df_display.to_string(index=False))
-            
-        else:
-            print("\nNo pairs found where Funding > Fees + Buffer.")
-            print(f"Required Rate: > {(0.0004 + min_profit_buffer)*100:.4f}% per hour")
-
+            time.sleep(1)
+        
+        print("\nTimeout reached.")
+        if order_id: 
+            print("Canceling remaining order...")
+            exchange.cancel_order(symbol, order_id)
+        return False
+        
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        if order_id: exchange.cancel_order(symbol, order_id)
+        return False
     except Exception as e:
         print(f"Error: {e}")
+        return False
 
+
+def main():
+    parser = argparse.ArgumentParser(description="Manual Trade Checker")
+    parser.add_argument("symbol", help="Trading Symbol (e.g., BTCUSDT)")
+    parser.add_argument("--action", choices=["OPEN", "CLOSE"], required=True, help="Action: OPEN or CLOSE")
+    parser.add_argument("--direction", choices=["LONG", "SHORT"], required=True, help="Position Direction")
+    parser.add_argument("--amount", type=float, required=True, help="Quantity in UNITS (e.g. 0.1 for BTC)")
+    
+    parser.add_argument("--type", choices=["limit", "smart", "agg"], default="smart", help="Execution Type")
+    parser.add_argument("--price", type=float, help="Limit Price (only for --type limit)")
+    parser.add_argument("--live", action="store_true", help="Use Mainnet")
+    
+    args = parser.parse_args()
+
+    # Setup Environment
+    global BASE_URL
+    if args.live:
+        BASE_URL = MAINNET_URL
+        print("USING MAINNET (REAL MONEY)")
+    else:
+        BASE_URL = TESTNET_URL
+        print("USING TESTNET")
+    
+    if not API_KEY or not API_SECRET:
+        print("Error: ASTER_API_KEY and ASTER_API_SECRET must be set.")
+        sys.exit(1)
+
+    # Determine Side
+    side = None
+    if args.action == "OPEN":
+        side = "BUY" if args.direction == "LONG" else "SELL"
+    else: # CLOSE
+        side = "SELL" if args.direction == "LONG" else "BUY"
+    
+    print(f"Intent: {args.action} {args.direction} -> Order: {side} {args.amount} {args.symbol}")
+
+    exchange = ExchangeInterface(base_url=BASE_URL)
+    
+    # Check Position Mode
+    is_hedge_mode = exchange.get_position_mode()
+    
+    # Check Position Risk (Debug)
+    risk = exchange.get_position_risk(args.symbol)
+    if risk:
+        print(f"DEBUG: Position Risk: {json.dumps(risk, indent=2)}")
+        # Double check mode from risk
+        # If risk has positionSide="BOTH", it's One-Way. If LONG/SHORT, it's Hedge.
+        if isinstance(risk, list) and len(risk) > 0:
+            p_side = risk[0].get('positionSide')
+            if p_side in ['LONG', 'SHORT']:
+                is_hedge_mode = True
+                print("DEBUG: Detected Hedge Mode from Position Risk")
+            elif p_side == 'BOTH':
+                is_hedge_mode = False
+                print("DEBUG: Detected One-Way Mode from Position Risk")
+
+    position_side = None
+    if is_hedge_mode:
+        position_side = args.direction # LONG or SHORT
+        print(f"Mode: Hedge Mode (PositionSide: {position_side})")
+    else:
+        print("Mode: One-Way Mode")
+
+    # Execute
+    if args.type == "limit":
+        if args.price is None:
+            print("Error: --price required for limit order")
+            sys.exit(1)
+        resp = exchange.place_order(args.symbol, side, "LIMIT", args.amount, args.price, position_side=position_side)
+        print("Order Response:", json.dumps(resp, indent=2))
+    
+    elif args.type == "smart":
+        smart_execute_sync(exchange, args.symbol, side, args.amount, aggressive=False, position_side=position_side)
+        
+    elif args.type == "agg":
+        smart_execute_sync(exchange, args.symbol, side, args.amount, aggressive=True, position_side=position_side)
 
 if __name__ == "__main__":
-    get_viable_scalps()
+    main()
