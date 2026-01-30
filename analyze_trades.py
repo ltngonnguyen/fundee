@@ -2,6 +2,7 @@ import pandas as pd
 import argparse
 import os
 import sys
+import json
 from datetime import datetime, timedelta
 import numpy as np
 
@@ -16,6 +17,89 @@ except ImportError:
     sys.exit(1)
 
 console = Console()
+
+def load_csv(file_path):
+    if not os.path.exists(file_path):
+        return None
+    try:
+        df = pd.read_csv(file_path)
+        df.columns = [c.strip() for c in df.columns]
+        if 'Timestamp' in df.columns:
+             df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+        return df
+    except: return None
+
+def analyze_order_quality(order_path):
+    df = load_csv(order_path)
+    if df is None or df.empty: return
+    
+    console.print(Panel("[bold yellow]Order Quality Analysis[/bold yellow]", border_style="yellow"))
+    
+    # Fill Rate
+    total_orders = len(df[df['Status'] == 'NEW']) # Assuming 'NEW' marks intent
+    # Or just count unique OrderIds
+    unique_orders = df['OrderId'].nunique()
+    filled = df[df['Status'] == 'FILLED']['OrderId'].nunique()
+    
+    fill_rate = (filled / unique_orders * 100) if unique_orders > 0 else 0
+    
+    # Slippage (AvgPrice vs Price) - Only for Limit orders that filled
+    filled_orders = df[df['Status'] == 'FILLED'].copy()
+    if not filled_orders.empty:
+        # Avoid div by zero
+        filled_orders['Slippage'] = (filled_orders['AvgPrice'] - filled_orders['Price']) / filled_orders['Price'] * 100
+        avg_slippage = filled_orders['Slippage'].abs().mean()
+    else:
+        avg_slippage = 0.0
+
+    grid = Table.grid(expand=True)
+    grid.add_column()
+    grid.add_row("Unique Orders:", str(unique_orders))
+    grid.add_row("Filled Orders:", str(filled))
+    grid.add_row("Fill Rate:", f"{fill_rate:.2f}%")
+    grid.add_row("Avg Slippage:", f"{avg_slippage:.4f}%")
+    console.print(grid)
+
+def analyze_market_opportunities(market_path):
+    df = load_csv(market_path)
+    if df is None or df.empty: return
+    
+    console.print(Panel("[bold cyan]Market Opportunity Analysis[/bold cyan]", border_style="cyan"))
+    
+    # Avg Spread
+    avg_spread = df['Spread'].mean() * 100
+    
+    # Potential Profit
+    avg_est_profit = df['EstProfit'].mean() * 100
+    
+    # Count High Yield Events (> 0.1%)
+    high_yield = df[df['FundingRate'].abs() > 0.001]
+    
+    grid = Table.grid(expand=True)
+    grid.add_column()
+    grid.add_row("Avg Market Spread:", f"{avg_spread:.4f}%")
+    grid.add_row("Avg Est. Profit:", f"{avg_est_profit:.4f}%")
+    grid.add_row("High Yield Events (>0.1%):", str(len(high_yield)))
+    console.print(grid)
+
+def analyze_rejections(decision_path):
+    df = load_csv(decision_path)
+    if df is None or df.empty: return
+    
+    console.print(Panel("[bold magenta]Strategy Rejections[/bold magenta]", border_style="magenta"))
+    
+    # Group by Reason
+    reasons = df['Reason'].value_counts().reset_index()
+    reasons.columns = ['Reason', 'Count']
+    
+    table = Table(box=box.SIMPLE)
+    table.add_column("Reason")
+    table.add_column("Count")
+    
+    for _, r in reasons.iterrows():
+        table.add_row(r['Reason'], str(r['Count']))
+        
+    console.print(table)
 
 def load_trades(file_path):
     if not os.path.exists(file_path):
@@ -222,9 +306,15 @@ def analyze_trades(file_path):
             for idx, row in bad_periods.iterrows():
                 console.print(f"  - {idx}: ${row['Net_PnL_USDT']:.2f}")
 
+    # --- New Granular Analysis ---
+    base_dir = os.path.dirname(file_path)
+    analyze_market_opportunities(os.path.join(base_dir, "market_log.csv"))
+    analyze_order_quality(os.path.join(base_dir, "order_log.csv"))
+    analyze_rejections(os.path.join(base_dir, "decision_log.csv"))
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Rich Trade Analysis")
-    parser.add_argument("file", nargs="?", default="live_trades.csv", help="Path to CSV")
+    parser.add_argument("file", nargs="?", default="logs/live_trades.csv", help="Path to CSV")
     args = parser.parse_args()
     
     analyze_trades(args.file)

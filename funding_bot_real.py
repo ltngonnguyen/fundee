@@ -15,15 +15,6 @@ from urllib.parse import urlencode
 import requests
 
 try:
-    from eth_abi.abi import encode
-    from eth_account import Account
-    from eth_account.messages import encode_defunct
-    from web3 import Web3
-except ImportError:
-    print("Warning: Web3 libraries not installed. Please run 'pip install -r requirements.txt'")
-    pass
-
-try:
     from textual import work
     from textual.app import App, ComposeResult
     from textual.containers import Container, Vertical
@@ -35,13 +26,14 @@ except ImportError:
     ComposeResult = None
     pass
 
+from funding_shared import ExchangeInterface, BASE_URL
+
+from funding_shared import ExchangeInterface, BASE_URL
+
 # ==========================================
 # CONFIGURATION
 # ==========================================
-BASE_URL = "https://fapi.asterdex.com"
-
-# REAL TRADING CONFIG
-DRY_RUN = False  # Set to True for simulation (if implemented), but we default to real orders now
+# BASE_URL imported from funding_shared
 
 API_KEY = os.getenv('ASTER_API_KEY')
 API_SECRET = os.getenv('ASTER_API_SECRET')
@@ -54,268 +46,10 @@ DEFAULT_MAKER = 0.0002
 DEFAULT_TAKER = 0.0004
 MIN_PROFIT_BUFFER = 0.0002
 
-class ExchangeInterface:
-    def __init__(self, logger=None):
-        self.logger = logger
-        self.precision_map = {}
-        self.load_exchange_info()
-    
-    def log(self, msg):
-        if self.logger: self.logger(msg)
-        else: print(msg)
-
-    def load_exchange_info(self):
-        try:
-            resp = requests.get(f"{BASE_URL}/fapi/v1/exchangeInfo", timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                for s in data['symbols']:
-                    filters = {f['filterType']: f for f in s['filters']}
-                    tick_size = float(filters['PRICE_FILTER']['tickSize']) if 'PRICE_FILTER' in filters else 0.0
-                    step_size = float(filters['LOT_SIZE']['stepSize']) if 'LOT_SIZE' in filters else 0.0
-                    self.precision_map[s['symbol']] = {
-                        'tick_size': tick_size,
-                        'step_size': step_size,
-                        'price_precision': s['pricePrecision'],
-                        'qty_precision': s['quantityPrecision']
-                    }
-        except Exception as e:
-            self.log(f"Error loading exchange info: {e}")
-
-    def normalize_price(self, symbol, price):
-        if symbol not in self.precision_map: return price
-        p_info = self.precision_map[symbol]
-        tick_size = p_info['tick_size']
-        precision = p_info['price_precision']
-        if tick_size == 0: return round(price, precision)
-        return round(round(price / tick_size) * tick_size, precision)
-
-    def normalize_quantity(self, symbol, qty):
-        if symbol not in self.precision_map: return qty
-        p_info = self.precision_map[symbol]
-        step_size = p_info['step_size']
-        precision = p_info['qty_precision']
-        if step_size == 0: return round(qty, precision)
-        # Use floor to avoid exceeding balance/limits
-        normalized = round(math.floor(qty / step_size) * step_size, precision)
-        if normalized <= 0 and qty > 0:
-             self.log(f"Quantity {qty} too small for symbol {symbol}. Step size: {step_size}")
-        return normalized
-
-    def _trim_dict(self, data):
-        for key in data:
-            value = data[key]
-            if isinstance(value, list):
-                new_value = []
-                for item in value:
-                    if isinstance(item, dict):
-                        new_value.append(json.dumps(self._trim_dict(item)))
-                    else:
-                        new_value.append(str(item))
-                data[key] = json.dumps(new_value)
-                continue
-            if isinstance(value, dict):
-                data[key] = json.dumps(self._trim_dict(value))
-                continue
-            data[key] = str(value)
-        return data
-
-    def _sign_request(self, params):
-        if not API_SECRET: return None
-        
-        # Filter None
-        params = {k: v for k, v in params.items() if v is not None}
-        
-        # Add required params
-        params['recvWindow'] = 50000
-        params['timestamp'] = int(time.time() * 1000)
-        
-        # Prepare for signing (convert to strings)
-        self._trim_dict(params)
-        
-        # Generate Nonce
-        nonce = int(time.time() * 1000000)
-        
-        # Generate JSON string for hashing
-        # Ensure consistent sorting and no spaces
-        json_str = json.dumps(params, sort_keys=True).replace(' ', '').replace("'", '"')
-        
-        user = USER_ADDRESS
-        signer = SIGNER_ADDRESS if SIGNER_ADDRESS else USER_ADDRESS
-        
-        # ABI Encode and Hash
-        encoded = encode(['string', 'address', 'address', 'uint256'], 
-                         [json_str, user, signer, nonce])
-        keccak_hex = Web3.keccak(encoded).hex()
-        
-        # Sign
-        signable_msg = encode_defunct(hexstr=keccak_hex)
-        signed_message = Account.sign_message(signable_message=signable_msg, private_key=API_SECRET)
-        
-        # Add Auth fields
-        params['nonce'] = nonce
-        params['user'] = user
-        params['signer'] = signer
-        params['signature'] = '0x' + signed_message.signature.hex()
-        
-        return params
-
-    def get_balance(self):
-        if not API_SECRET: 
-            self.log("No API_SECRET set.")
-            return 0.0
-        if not USER_ADDRESS:
-            self.log("No ASTER_USER_ADDRESS set. Required for Aster Dex.")
-            return 0.0
-            
-        try:
-            params = {}
-            query = self._sign_request(params)
-            headers = {'User-Agent': 'PythonApp/1.0'}
-            # Try v2 balance first as it is more common
-            resp = requests.get(f"{BASE_URL}/fapi/v3/balance", params=query, headers=headers, timeout=5)
-            if resp.status_code == 200:
-                for b in resp.json():
-                    if b['asset'] == 'USDT':
-                        val = float(b['availableBalance'])
-                        # self.log(f"Balance found: {val}")
-                        return val
-            else:
-                self.log(f"Balance fetch failed: {resp.status_code} {resp.text}")
-        except Exception as e:
-            self.log(f"Balance Exception: {e}")
-        return None
-
-    def get_positions(self):
-        if not API_SECRET: return []
-        try:
-            params = {}
-            query = self._sign_request(params)
-            headers = {'User-Agent': 'PythonApp/1.0'}
-            resp = requests.get(f"{BASE_URL}/fapi/v3/positionRisk", params=query, headers=headers, timeout=5)
-            if resp.status_code == 200:
-                # Return only active positions
-                return [p for p in resp.json() if float(p['positionAmt']) != 0]
-            else:
-                 self.log(f"Pos Error: {resp.status_code} {resp.text}")
-        except Exception as e:
-             self.log(f"Pos Exception: {e}")
-        return []
-
-    def get_position_mode(self):
-        try:
-            params = {}
-            if API_SECRET:
-                # GET /fapi/v3/positionSide/dual requires auth
-                query = self._sign_request(params)
-                headers = {
-                    'User-Agent': 'PythonApp/1.0',
-                    'X-MBX-APIKEY': API_KEY
-                }
-                resp = requests.get(f"{BASE_URL}/fapi/v3/positionSide/dual", params=query, headers=headers, timeout=5)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    val = data.get('dualSidePosition')
-                    if str(val).lower() == 'true': return True
-                    return False
-                else:
-                    self.log(f"Position Mode Failed: {resp.status_code} {resp.text}")
-        except Exception as e:
-            self.log(f"Error checking position mode: {e}")
-        return False # Default to One-way
-
-    def get_position_risk(self, symbol):
-        if not API_SECRET: return None
-        try:
-            params = {'symbol': symbol}
-            query = self._sign_request(params)
-            headers = {
-                'User-Agent': 'PythonApp/1.0',
-                'X-MBX-APIKEY': API_KEY
-            }
-            resp = requests.get(f"{BASE_URL}/fapi/v3/positionRisk", params=query, headers=headers, timeout=5)
-            if resp.status_code == 200:
-                return resp.json()
-            else:
-                self.log(f"Position Risk Failed: {resp.status_code} {resp.text}")
-        except Exception as e:
-            self.log(f"Error checking position risk: {e}")
-        return None
-
-    def place_order(self, symbol, side, type, quantity, price=None, time_in_force="GTC", position_side=None):
-        # if DRY_RUN: ... (Removed for Testnet usage)
-        
-        if not API_SECRET: return None
-        
-        qty = self.normalize_quantity(symbol, quantity)
-        if qty <= 0: 
-            self.log(f"Invalid Quantity: {qty}")
-            return None
-
-        params = {
-            'symbol': symbol,
-            'side': side,
-            'type': type,
-            'quantity': qty,
-        }
-        
-        if position_side:
-            params['positionSide'] = position_side
-        
-        if type == 'LIMIT':
-            if price is None: return None
-            params['price'] = self.normalize_price(symbol, price)
-            params['timeInForce'] = time_in_force
-
-        try:
-            query = self._sign_request(params)
-            headers = {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'User-Agent': 'PythonApp/1.0',
-                'X-MBX-APIKEY': API_KEY
-            }
-            resp = requests.post(f"{BASE_URL}/fapi/v3/order", data=query, headers=headers, timeout=5)
-            return resp.json()
-        except Exception as e:
-            print(f"Order failed: {e}")
-            return None
-
-    def cancel_order(self, symbol, order_id):
-        # if DRY_RUN: return {'status': 'CANCELED'} (Removed for Testnet)
-        if not API_SECRET: return None
-        try:
-            params = {'symbol': symbol, 'orderId': order_id}
-            query = self._sign_request(params)
-            headers = {'User-Agent': 'PythonApp/1.0'}
-            resp = requests.delete(f"{BASE_URL}/fapi/v3/order", data=query, headers=headers, timeout=5)
-            return resp.json()
-        except Exception as e:
-            print(f"Cancel failed: {e}")
-            return None
-
-    def get_order(self, symbol, order_id):
-        # if DRY_RUN: return {'status': 'FILLED'} (Removed for Testnet)
-        if not API_SECRET: return None
-        try:
-            params = {'symbol': symbol, 'orderId': order_id}
-            query = self._sign_request(params)
-            headers = {'User-Agent': 'PythonApp/1.0'}
-            resp = requests.get(f"{BASE_URL}/fapi/v3/order", params=query, headers=headers, timeout=5)
-            return resp.json()
-        except: return None
-
-    def get_book_ticker(self, symbol):
-        try:
-            resp = requests.get(f"{BASE_URL}/fapi/v1/ticker/bookTicker", params={'symbol': symbol}, timeout=5)
-            if resp.status_code == 200:
-                return resp.json()
-        except: pass
-        return None
-
 class FundingLogic:
     def __init__(self, interface):
         self.interface = interface
-        self.exchange = ExchangeInterface(logger=self.interface.log_message)
+        self.exchange = ExchangeInterface(base_url=BASE_URL, logger=self.interface.log_message)
         self.balance = 0.0
         self.trade_size = TRADE_SIZE_USDT
         
@@ -333,9 +67,47 @@ class FundingLogic:
         self.sim_counter = 0
         
         # Log file
-        if not os.path.exists("live_trades.csv"):
-            with open("live_trades.csv", "w") as f:
+        if not os.path.exists("logs/live_trades.csv"):
+            with open("logs/live_trades.csv", "w") as f:
                 f.write("Timestamp,Strategy,Symbol,Direction,Entry,Exit,Net_PnL_USDT,Net_PnL_Pct,Balance\n")
+
+        # Enhanced Logging for Backtesting
+        if not os.path.exists("logs/market_log.csv"):
+            with open("logs/market_log.csv", "w") as f:
+                f.write("Timestamp,Symbol,FundingRate,NextFundingTime,Bid,Ask,Spread,EstProfit,MakerFee,TakerFee\n")
+                
+        if not os.path.exists("logs/order_log.csv"):
+            with open("logs/order_log.csv", "w") as f:
+                f.write("Timestamp,Symbol,OrderId,Side,Type,Price,Qty,Status,ExecutedQty,AvgPrice,Msg\n")
+                
+        if not os.path.exists("logs/decision_log.csv"):
+            with open("logs/decision_log.csv", "w") as f:
+                f.write("Timestamp,Symbol,Strategy,Action,Reason\n")
+
+    def log_market_data(self, candidates):
+        """Log market snapshot of viable pairs for backtesting."""
+        ts = datetime.now()
+        with open("logs/market_log.csv", "a") as f:
+            for c in candidates:
+                sym = c['symbol']
+                tik = self.ticker_map.get(sym)
+                if not tik: continue
+                
+                fees = self.fee_cache.get(sym, {'maker': DEFAULT_MAKER, 'taker': DEFAULT_TAKER})
+                spread = (tik['ask'] - tik['bid']) / tik['ask'] if tik['ask'] > 0 else 0
+                est_profit = abs(c['funding_rate']) - (fees['taker'] * 2)
+                
+                f.write(f"{ts},{sym},{c['funding_rate']:.6f},{c['next_funding_time']},{tik['bid']},{tik['ask']},{spread:.6f},{est_profit:.6f},{fees['maker']},{fees['taker']}\n")
+
+    def log_order_event(self, symbol, order_id, side, type, price, qty, status, executed, avg_price, msg=""):
+        """Log granular order events."""
+        with open("logs/order_log.csv", "a") as f:
+            f.write(f"{datetime.now()},{symbol},{order_id},{side},{type},{price},{qty},{status},{executed},{avg_price},{msg}\n")
+
+    def log_decision(self, symbol, strategy, action, reason):
+        """Log why we did or did not take a trade."""
+        with open("logs/decision_log.csv", "a") as f:
+            f.write(f"{datetime.now()},{symbol},{strategy},{action},{reason}\n")
 
     def start(self):
         self.interface.log_message(f"Starting Logic (Base: {BASE_URL})")
@@ -455,15 +227,21 @@ class FundingLogic:
                     spread = (tik['ask'] - tik['bid']) / tik['ask']
                     fees = self.fee_cache.get(sym, {'maker': DEFAULT_MAKER, 'taker': DEFAULT_TAKER})
                     
-                    if spread > 0.005: continue # Spread too high
+                    if spread > 0.005: 
+                        self.log_decision(sym, "SCAN", "SKIP", f"High Spread {spread:.4f}")
+                        continue # Spread too high
+                    
                     est_profit = abs(rate) - (fees['taker'] * 2)
-                    if spread > est_profit: continue
+                    if spread > est_profit: 
+                        self.log_decision(sym, "SCAN", "SKIP", f"Spread > Profit ({spread:.4f} > {est_profit:.4f})")
+                        continue
 
                 if sym not in self.fee_cache and sym not in self.fee_queue: self.fee_queue.add(sym)
                 candidates.append({'symbol': sym, 'funding_rate': rate, 'next_funding_time': nxt, 'direction': "SHORT" if rate > 0 else "LONG"})
         
         candidates.sort(key=lambda x: abs(x['funding_rate']), reverse=True)
         self.viable_pairs = candidates
+        self.log_market_data(candidates)
         self.interface.update_ui()
 
     def log_trade(self, s):
@@ -473,7 +251,7 @@ class FundingLogic:
             else: pnl_pct = (s['entry_price'] - s['exit_price']) / s['entry_price']
         else: pnl_pct = 0.0
 
-        with open("live_trades.csv", "a") as f:
+        with open("logs/live_trades.csv", "a") as f:
             f.write(f"{datetime.now()},{s['strategy']},{s['symbol']},{s['direction']},{s['entry_price']},{s['exit_price']},{s.get('net_pnl_amt',0):.4f},{pnl_pct:.6f},{self.balance:.4f}\n")
 
     def remove_pending(self, symbol):
@@ -509,10 +287,12 @@ class FundingLogic:
                         resp = self.exchange.place_order(symbol, side, "LIMIT", qty, price, time_in_force, position_side=position_side)
                         if resp and 'orderId' in resp:
                             order_id = resp.get('orderId')
+                            self.interface.call_from_thread(self.log_order_event, symbol, order_id, side, "LIMIT", price, qty, "NEW", 0, 0, "Placed")
                             if aggressive: 
                                 # Assume filled for dry run or wait short for agg
                                 time.sleep(0.5)
                         else:
+                            self.interface.call_from_thread(self.log_decision, symbol, "EXEC", "FAIL", f"Place Error: {resp}")
                             time.sleep(1)
                             continue
                     
@@ -527,6 +307,7 @@ class FundingLogic:
                              if avg == 0 and filled > 0: avg = float(status.get('cumQuote', 0)) / filled
                              if avg == 0: avg = price # Fallback
                              
+                             self.interface.call_from_thread(self.log_order_event, symbol, order_id, side, "LIMIT", price, qty, s, filled, avg, "Done")
                              self.interface.call_from_thread(on_success, filled, avg, order_id)
                              return
                         
@@ -541,6 +322,7 @@ class FundingLogic:
                              if side == "SELL" and new_target < current_p: reprice = True
                              
                              if reprice:
+                                 self.interface.call_from_thread(self.log_order_event, symbol, order_id, side, "LIMIT", current_p, qty, "CANCEL_REPRICE", filled, 0, f"Reprice to {new_target}")
                                  self.exchange.cancel_order(symbol, order_id)
                                  order_id = None 
                                  continue
@@ -548,7 +330,9 @@ class FundingLogic:
                     time.sleep(1)
                 
                 # Timeout / Cleanup
-                if order_id: self.exchange.cancel_order(symbol, order_id)
+                if order_id: 
+                    self.interface.call_from_thread(self.log_order_event, symbol, order_id, side, "LIMIT", 0, qty, "TIMEOUT_CANCEL", 0, 0, "Timeout")
+                    self.exchange.cancel_order(symbol, order_id)
                 self.interface.call_from_thread(on_fail, "Timeout")
                 
             except Exception as e:
@@ -867,14 +651,12 @@ if __name__ == "__main__":
         # Launch killer_bot.py in the background
         # We always run it headless to avoid TUI conflicts with the main bot
         cmd = [sys.executable, "killer_bot.py", "--headless"]
-        if not args.testnet:
-             cmd.append("--live")
-            
+        
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Launching Companion: killer_bot.py...")
 
         
         # Open log file for the background process
-        with open("killer_bot.log", "a") as log_file:
+        with open("logs/killer_bot.log", "a") as log_file:
             log_file.write(f"\n[{datetime.now()}] STARTING KILLER BOT SESSION\n")
             killer_process = subprocess.Popen(cmd, stdout=log_file, stderr=log_file)
 

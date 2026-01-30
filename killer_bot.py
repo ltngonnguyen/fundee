@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import hmac
+import json
 import time
 import math
 import os
@@ -11,14 +12,6 @@ from queue import Queue
 from urllib.parse import urlencode
 
 import requests
-
-try:
-    from eth_abi.abi import encode
-    from eth_account import Account
-    from eth_account.messages import encode_defunct
-    from web3 import Web3
-except ImportError:
-    pass
 
 try:
     from textual.app import App, ComposeResult
@@ -32,196 +25,17 @@ except ImportError:
 # ==========================================
 # CONFIGURATION
 # ==========================================
-MAINNET_URL = "https://fapi.asterdex.com"
-TESTNET_URL = "https://fapi.asterdex-testnet.com"
+BASE_URL = "https://fapi.asterdex.com"
 
-# REAL TRADING CONFIG
-DRY_RUN = True  # Set to False via --live flag
-
-BASE_URL = TESTNET_URL if DRY_RUN else MAINNET_URL
 API_KEY = os.getenv('ASTER_API_KEY')
 API_SECRET = os.getenv('ASTER_API_SECRET')
 USER_ADDRESS = os.getenv('ASTER_USER_ADDRESS')
 SIGNER_ADDRESS = os.getenv('ASTER_SIGNER_ADDRESS', USER_ADDRESS)
 
-class ExchangeInterface:
-    def __init__(self):
-        self.precision_map = {}
-        self.load_exchange_info()
-
-    def load_exchange_info(self):
-        try:
-            resp = requests.get(f"{BASE_URL}/fapi/v1/exchangeInfo", timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                for s in data['symbols']:
-                    filters = {f['filterType']: f for f in s['filters']}
-                    tick_size = float(filters['PRICE_FILTER']['tickSize']) if 'PRICE_FILTER' in filters else 0.0
-                    step_size = float(filters['LOT_SIZE']['stepSize']) if 'LOT_SIZE' in filters else 0.0
-                    self.precision_map[s['symbol']] = {
-                        'tick_size': tick_size,
-                        'step_size': step_size,
-                        'price_precision': s['pricePrecision'],
-                        'qty_precision': s['quantityPrecision']
-                    }
-        except Exception as e:
-            print(f"Error loading exchange info: {e}")
-
-    def normalize_price(self, symbol, price):
-        if symbol not in self.precision_map: return price
-        p_info = self.precision_map[symbol]
-        tick_size = p_info['tick_size']
-        precision = p_info['price_precision']
-        if tick_size == 0: return round(price, precision)
-        return round(round(price / tick_size) * tick_size, precision)
-
-    def normalize_quantity(self, symbol, qty):
-        if symbol not in self.precision_map: return qty
-        p_info = self.precision_map[symbol]
-        step_size = p_info['step_size']
-        precision = p_info['qty_precision']
-        if step_size == 0: return round(qty, precision)
-        return round(math.floor(qty / step_size) * step_size, precision)
-
-    def _trim_dict(self, data):
-        for key in data:
-            value = data[key]
-            if isinstance(value, list):
-                new_value = []
-                for item in value:
-                    if isinstance(item, dict):
-                        new_value.append(json.dumps(self._trim_dict(item)))
-                    else:
-                        new_value.append(str(item))
-                data[key] = json.dumps(new_value)
-                continue
-            if isinstance(value, dict):
-                data[key] = json.dumps(self._trim_dict(value))
-                continue
-            data[key] = str(value)
-        return data
-
-    def _sign_request(self, params):
-        if not API_SECRET: return None
-        
-        # Filter None
-        params = {k: v for k, v in params.items() if v is not None}
-        
-        # Add required params
-        params['recvWindow'] = 50000
-        params['timestamp'] = int(time.time() * 1000)
-        
-        # Prepare for signing (convert to strings)
-        self._trim_dict(params)
-        
-        # Generate Nonce
-        nonce = int(time.time() * 1000000)
-        
-        # Generate JSON string for hashing
-        json_str = json.dumps(params, sort_keys=True).replace(' ', '').replace("'", '"')
-        
-        user = USER_ADDRESS
-        signer = SIGNER_ADDRESS if SIGNER_ADDRESS else USER_ADDRESS
-        
-        # ABI Encode and Hash
-        encoded = encode(['string', 'address', 'address', 'uint256'], 
-                         [json_str, user, signer, nonce])
-        keccak_hex = Web3.keccak(encoded).hex()
-        
-        # Sign
-        signable_msg = encode_defunct(hexstr=keccak_hex)
-        signed_message = Account.sign_message(signable_message=signable_msg, private_key=API_SECRET)
-        
-        # Add Auth fields
-        params['nonce'] = nonce
-        params['user'] = user
-        params['signer'] = signer
-        params['signature'] = '0x' + signed_message.signature.hex()
-        
-        return params
-
-    def get_positions(self):
-        # if DRY_RUN: ... (Removed for Testnet)
-            
-        if not API_SECRET: return []
-        try:
-            params = {}
-            query = self._sign_request(params)
-            headers = {'User-Agent': 'PythonApp/1.0'}
-            resp = requests.get(f"{BASE_URL}/fapi/v3/positionRisk", params=query, headers=headers, timeout=5)
-            if resp.status_code == 200:
-                return [p for p in resp.json() if float(p['positionAmt']) != 0]
-        except: pass
-        return []
-
-    def place_order(self, symbol, side, type, quantity, price=None, time_in_force="GTC"):
-        # if DRY_RUN: ... (Removed for Testnet)
-
-        if not API_SECRET: return None
-        
-        qty = self.normalize_quantity(symbol, quantity)
-        if qty <= 0: return None
-
-        params = {
-            'symbol': symbol,
-            'side': side,
-            'type': type,
-            'quantity': qty,
-        }
-        
-        if type == 'LIMIT':
-            if price is None: return None
-            params['price'] = self.normalize_price(symbol, price)
-            params['timeInForce'] = time_in_force
-
-        try:
-            query = self._sign_request(params)
-            headers = {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'User-Agent': 'PythonApp/1.0'
-            }
-            resp = requests.post(f"{BASE_URL}/fapi/v3/order", data=query, headers=headers, timeout=5)
-            return resp.json()
-        except Exception as e:
-            print(f"Order failed: {e}")
-            return None
-
-    def cancel_order(self, symbol, order_id):
-        # if DRY_RUN: ... (Removed for Testnet)
-        if not API_SECRET: return None
-        try:
-            params = {'symbol': symbol, 'orderId': order_id}
-            query = self._sign_request(params)
-            headers = {'User-Agent': 'PythonApp/1.0'}
-            resp = requests.delete(f"{BASE_URL}/fapi/v3/order", data=query, headers=headers, timeout=5)
-            return resp.json()
-        except Exception as e:
-            print(f"Cancel failed: {e}")
-            return None
-
-    def get_order(self, symbol, order_id):
-        # if DRY_RUN: ... (Removed for Testnet)
-        if not API_SECRET: return None
-        try:
-            params = {'symbol': symbol, 'orderId': order_id}
-            query = self._sign_request(params)
-            headers = {'User-Agent': 'PythonApp/1.0'}
-            resp = requests.get(f"{BASE_URL}/fapi/v3/order", params=query, headers=headers, timeout=5)
-            return resp.json()
-        except: return None
-
-    def get_book_ticker(self, symbol):
-        try:
-            resp = requests.get(f"{BASE_URL}/fapi/v1/ticker/bookTicker", params={'symbol': symbol}, timeout=5)
-            if resp.status_code == 200:
-                return resp.json()
-        except: pass
-        return None
-
 class KillerLogic:
     def __init__(self, interface):
         self.interface = interface
-        self.exchange = ExchangeInterface()
+        self.exchange = ExchangeInterface(base_url=BASE_URL)
         self.killing_active = False
         self.pending_kills = set() # Symbols being killed
         self.killed_history = []
@@ -377,7 +191,7 @@ class HeadlessInterface:
         
     def run(self):
         self.logic = KillerLogic(self)
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting KILLER MONITOR (Dry Run: {DRY_RUN})...")
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting KILLER MONITOR (LIVE MODE)...")
         self.logic.start()
         try:
             while self.running:
@@ -411,7 +225,7 @@ class KillerApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        yield Static(f"KILLER MONITOR (Dry Run: {DRY_RUN})", id="header", classes="section_title")
+        yield Static(f"KILLER MONITOR (LIVE MODE)", id="header", classes="section_title")
         yield Static("IDLE - WAITING FOR KILL WINDOW", id="status_bar", classes="status_idle")
         yield Vertical(
             Static("Detected Stray Positions", classes="section_title"),
@@ -463,15 +277,7 @@ class KillerApp(App):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--headless", action="store_true", help="Run in headless mode")
-    parser.add_argument("--live", action="store_true", help="DISABLE Dry Run (Real Money)")
     args = parser.parse_args()
-
-    if args.live:
-        DRY_RUN = False
-        BASE_URL = MAINNET_URL
-    else:
-        DRY_RUN = True
-        BASE_URL = TESTNET_URL
     
     if args.headless: HeadlessInterface().run()
     else: KillerApp().run()
