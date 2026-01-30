@@ -119,6 +119,13 @@ class ExchangeInterface:
         
         user = USER_ADDRESS
         signer = SIGNER_ADDRESS if SIGNER_ADDRESS else USER_ADDRESS
+
+        try:
+            user = Web3.to_checksum_address(user)
+            signer = Web3.to_checksum_address(signer)
+        except Exception:
+            self.log(f"Invalid Address Format: User={user}, Signer={signer}")
+            return None
         
         # ABI Encode and Hash
         encoded = encode(['string', 'address', 'address', 'uint256'], 
