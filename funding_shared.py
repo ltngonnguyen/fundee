@@ -310,3 +310,172 @@ class ExchangeInterface:
         except Exception as e:
             self.log(f"Set leverage failed: {e}")
             return None
+
+class SmartOrderExecutor:
+    """
+    Shared logic for smart order execution (Chasing/Passive -> Aggressive).
+    Can be used synchronously or wrapped in a thread.
+    """
+    def __init__(self, exchange, symbol, side, qty, aggressive=False, position_side=None, leverage=None, callbacks=None):
+        self.exchange = exchange
+        self.symbol = symbol
+        self.side = side
+        self.qty = float(qty)
+        self.aggressive = aggressive
+        self.position_side = position_side
+        self.leverage = leverage
+        self.callbacks = callbacks or {}
+        
+        # State
+        self.order_id = None
+        self.cumulative_filled = 0.0
+        self.qty_left = self.qty
+        self.last_price = 0.0
+
+    def log(self, msg):
+        if 'log' in self.callbacks: 
+            self.callbacks['log'](msg)
+        # Fallback is silent or handled by caller
+
+    def emit_event(self, event_type, *args):
+        """
+        Generic event emitter.
+        event_type: 'ORDER_UPDATE', 'DECISION', 'SUCCESS', 'FAIL'
+        """
+        if 'on_event' in self.callbacks:
+            self.callbacks['on_event'](event_type, *args)
+
+    def run(self, timeout=70, switch_mode_time=None):
+        # Set Leverage if requested
+        if self.leverage is not None:
+            self.log(f"Setting leverage for {self.symbol} to {self.leverage}x")
+            self.exchange.set_leverage(self.symbol, self.leverage)
+
+        start_time = time.time()
+
+        try:
+            while (time.time() - start_time) < timeout:
+                # 1. Check for Aggressive Switch
+                if not self.aggressive and switch_mode_time and time.time() >= switch_mode_time:
+                    self.aggressive = True
+                    self.log(f"Switching to Aggressive Mode for {self.symbol}")
+                    # If we have an active passive order, we need to cancel it first to go aggressive
+                    # We continue; the reprice logic below will handle cancellation if price/mode mismatch
+                    pass
+
+                # 2. Fetch Price
+                ticker = self.exchange.get_book_ticker(self.symbol)
+                if not ticker:
+                    time.sleep(1)
+                    continue
+
+                best_bid = float(ticker["bidPrice"])
+                best_ask = float(ticker["askPrice"])
+
+                # 3. Determine Price based on Mode
+                if self.aggressive:
+                    # Marketable Limit: Buy at Ask+1%, Sell at Bid-1%
+                    price = best_ask * 1.01 if self.side == "BUY" else best_bid * 0.99
+                    time_in_force = "GTC"
+                else:
+                    # Chase: Buy at Bid, Sell at Ask (Passive)
+                    price = best_bid if self.side == "BUY" else best_ask
+                    time_in_force = "GTC"
+
+                # 4. Place Order if None exists
+                if not self.order_id:
+                    # Safety check on Min Qty (approx 5.5 USDT)
+                    if (self.qty_left * price) < 5.5:
+                        self.log("Remainder too small, marking done.")
+                        self.emit_event('SUCCESS', self.cumulative_filled, price, "Partial-Done")
+                        return True
+
+                    resp = self.exchange.place_order(
+                        self.symbol,
+                        self.side,
+                        "LIMIT",
+                        self.qty_left,
+                        price,
+                        time_in_force,
+                        position_side=self.position_side,
+                    )
+                    
+                    if resp and "orderId" in resp:
+                        self.order_id = resp.get("orderId")
+                        self.last_price = price
+                        self.emit_event('ORDER_UPDATE', self.order_id, price, self.qty_left, "NEW", 0, 0, f"Placed ({'Agg' if self.aggressive else 'Pas'})")
+                        if self.aggressive:
+                            time.sleep(0.5)
+                    else:
+                        self.emit_event('DECISION', "EXEC", "FAIL", f"Place Error: {resp}")
+                        time.sleep(1)
+                        continue
+
+                # 5. Check Status
+                status = self.exchange.get_order(self.symbol, self.order_id)
+                if status:
+                    s = status["status"]
+                    this_order_filled = float(status.get("executedQty", 0))
+
+                    # Done?
+                    if s == "FILLED" or (s == "CANCELED" and this_order_filled >= self.qty_left * 0.99):
+                        self.cumulative_filled += this_order_filled
+                        avg = float(status.get("avgPrice", self.last_price))
+                        if avg == 0 and this_order_filled > 0:
+                            avg = float(status.get("cumQuote", 0)) / this_order_filled
+
+                        self.emit_event('ORDER_UPDATE', self.order_id, self.last_price, self.qty_left, s, this_order_filled, avg, "Done")
+                        self.emit_event('SUCCESS', self.cumulative_filled, avg, self.order_id)
+                        return True
+
+                    # Logic for Chase / Reprice
+                    should_cancel = False
+
+                    # A: Switch to Aggressive?
+                    if not self.aggressive and switch_mode_time and time.time() >= switch_mode_time:
+                        should_cancel = True
+                    
+                    # B: Price Moved? (Only if Passive)
+                    if not self.aggressive and not should_cancel:
+                        current_p = float(status.get("price", self.last_price))
+                        # Check if price moved
+                        # If Buying (Bid), and New Best Bid > Order Price -> We are behind.
+                        if self.side == "BUY" and price > current_p:
+                            should_cancel = True
+                        # If Selling (Ask), and New Best Ask < Order Price -> We are behind.
+                        if self.side == "SELL" and price < current_p:
+                            should_cancel = True
+                    
+                    if should_cancel:
+                        self.log(f"Repricing {self.symbol}...")
+                        self.exchange.cancel_order(self.symbol, self.order_id)
+                        # We wait for the next loop to verify cancellation or just clear ID
+                        # Ideally, wait for CANCELED status, but to be fast, we just clear ID.
+                        # However, to be safe, we check filled qty on cancel in next loop or assume cancel worked.
+                        # Simple approach: clear ID, loop will re-check or re-place.
+                        self.order_id = None
+                        
+                        # Check if we got any fill during that time (optional optimization)
+                        if this_order_filled > 0:
+                            self.cumulative_filled += this_order_filled
+                            self.qty_left -= this_order_filled
+                            self.emit_event('ORDER_UPDATE', self.order_id, self.last_price, self.qty_left, "PARTIAL", this_order_filled, 0, "Repricing")
+                        
+                        continue # Loop immediately
+
+                time.sleep(1)
+
+            # Timeout
+            self.log("Timeout reached.")
+            if self.order_id:
+                self.exchange.cancel_order(self.symbol, self.order_id)
+            self.emit_event('FAIL', "Timeout")
+            return False
+
+        except Exception as e:
+            self.log(f"Exception in SmartOrder: {e}")
+            if self.order_id:
+                self.exchange.cancel_order(self.symbol, self.order_id)
+            self.emit_event('FAIL', str(e))
+            return False
+

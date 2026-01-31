@@ -7,7 +7,7 @@ import math
 from datetime import datetime
 import requests
 
-from funding_shared import ExchangeInterface
+from funding_shared import ExchangeInterface, SmartOrderExecutor
 
 # ==========================================
 # CONFIGURATION
@@ -48,98 +48,6 @@ def check_volumes(exchange):
             print(f"Error fetching ticker data: {resp.status_code} {resp.text}")
     except Exception as e:
         print(f"Exception: {e}")
-
-def smart_execute_sync(exchange, symbol, side, qty, aggressive=False, position_side=None):
-    """
-    Synchronous version of smart_execute for CLI use.
-    """
-    order_id = None
-    start_time = time.time()
-    
-    print(f"--- Smart Execute: {side} {qty} {symbol} (Aggressive: {aggressive}) ---")
-    
-    try:
-        # Loop for chasing (max 30s)
-        while (time.time() - start_time) < 30:
-            ticker = exchange.get_book_ticker(symbol)
-            if not ticker: 
-                time.sleep(1)
-                continue
-
-            best_bid = float(ticker['bidPrice'])
-            best_ask = float(ticker['askPrice'])
-            
-            # Target Price
-            if aggressive:
-                # Marketable Limit: Buy at Ask+1%, Sell at Bid-1% (Reduced from 2% to avoid price filters)
-                price = best_ask * 1.01 if side == "BUY" else best_bid * 0.99
-                time_in_force = "GTC" 
-            else:
-                # Chase: Buy at Bid, Sell at Ask (Maker attempt)
-                price = best_bid if side == "BUY" else best_ask
-                time_in_force = "GTC"
-            
-            if not order_id:
-                print(f"Placing initial order @ {price:.4f}...")
-                resp = exchange.place_order(symbol, side, "LIMIT", qty, price, time_in_force, position_side=position_side)
-                if resp and 'orderId' in resp:
-                    order_id = resp.get('orderId')
-                    print(f"Order placed: ID {order_id}")
-                    if aggressive: 
-                        time.sleep(0.5)
-                else:
-                    print(f"Order placement failed: {resp}")
-                    time.sleep(1)
-                    continue
-            
-            # Check Status
-            status = exchange.get_order(symbol, order_id)
-            if status:
-                s = status['status']
-                filled = float(status.get('executedQty', 0))
-                
-                if s == 'FILLED' or (s == 'CANCELED' and filled >= qty*0.99):
-                     avg = float(status.get('avgPrice', price))
-                     if avg == 0 and filled > 0: avg = float(status.get('cumQuote', 0)) / filled
-                     print(f"SUCCESS: Filled {filled} @ {avg:.4f}")
-                     return True
-                
-                # Logic for Chase Update
-                if not aggressive:
-                     current_p = float(status['price'])
-                     # Check if price moved
-                     new_target = best_bid if side == "BUY" else best_ask
-                     
-                     reprice = False
-                     # If trying to BUY, and Bid > Current Price, we are behind.
-                     if side == "BUY" and new_target > current_p: reprice = True
-                     # If trying to SELL, and Ask < Current Price, we are behind.
-                     if side == "SELL" and new_target < current_p: reprice = True
-                     
-                     if reprice:
-                         print(f"Price moved ({current_p} -> {new_target}). Repricing...")
-                         exchange.cancel_order(symbol, order_id)
-                         order_id = None 
-                         continue
-                
-                print(f"Status: {s}, Filled: {filled}/{qty}...", end='\r')
-            
-            time.sleep(1)
-        
-        print("\nTimeout reached.")
-        if order_id: 
-            print("Canceling remaining order...")
-            exchange.cancel_order(symbol, order_id)
-        return False
-        
-    except KeyboardInterrupt:
-        print("\nInterrupted.")
-        if order_id: exchange.cancel_order(symbol, order_id)
-        return False
-    except Exception as e:
-        print(f"Error: {e}")
-        return False
-
 
 def main():
     parser = argparse.ArgumentParser(description="Manual Trade Checker")
@@ -226,11 +134,33 @@ def main():
         resp = exchange.place_order(args.symbol, side, "LIMIT", args.amount, args.price, position_side=position_side)
         print("Order Response:", json.dumps(resp, indent=2))
     
-    elif args.type == "smart":
-        smart_execute_sync(exchange, args.symbol, side, args.amount, aggressive=False, position_side=position_side)
+    elif args.type in ["smart", "agg"]:
+        aggressive = (args.type == "agg")
+        print(f"--- Smart Execute: {side} {args.amount} {args.symbol} (Aggressive: {aggressive}) ---")
         
-    elif args.type == "agg":
-        smart_execute_sync(exchange, args.symbol, side, args.amount, aggressive=True, position_side=position_side)
+        def _on_event(event, *e_args):
+            if event == 'SUCCESS':
+                print(f"SUCCESS: Filled {e_args[0]} @ {e_args[1]:.4f}")
+            elif event == 'FAIL':
+                print(f"FAIL: {e_args[0]}")
+            elif event == 'ORDER_UPDATE':
+                # e_args: order_id, price, qty_left, status, filled, avg, note
+                print(f"Status: {e_args[3]}, Filled: {e_args[4]}/{args.amount} ({e_args[6]})")
+            elif event == 'DECISION':
+                # e_args: type, status, note
+                print(f"Decision: {e_args[2]}")
 
-if __name__ == "__main__":
-    main()
+        executor = SmartOrderExecutor(
+            exchange, args.symbol, side, args.amount, aggressive=aggressive, position_side=position_side,
+            callbacks={'log': print, 'on_event': _on_event}
+        )
+        try:
+            executor.run(timeout=30)
+        except KeyboardInterrupt:
+            print("\nInterrupted.")
+            # Basic cleanup if needed, though run() should handle interrupts gracefully if possible
+            # But run() captures exceptions, maybe not KeyboardInterrupt.
+            # Let's rely on run()'s internal handling or add explicit if needed.
+            # SmartOrderExecutor catches Exception, which doesn't include KeyboardInterrupt.
+            if executor.order_id:
+                exchange.cancel_order(args.symbol, executor.order_id)

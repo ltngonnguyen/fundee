@@ -26,7 +26,7 @@ except ImportError:
     ComposeResult = None
     pass
 
-from funding_shared import BASE_URL, ExchangeInterface
+from funding_shared import BASE_URL, ExchangeInterface, SmartOrderExecutor
 
 # ==========================================
 # CONFIGURATION
@@ -483,186 +483,33 @@ class FundingLogic:
         leverage=None,
     ):
         def _worker():
-            nonlocal aggressive
-            order_id = None
-            cumulative_filled = 0.0
-            qty_left = qty
+            def _on_event(event, *args):
+                if event == 'ORDER_UPDATE':
+                     # args: order_id, price, qty_left, status, filled, avg, note
+                     self.interface.call_from_thread(
+                        self.log_order_event, symbol, args[0], side, "LIMIT", args[1], args[2], args[3], args[4], args[5], args[6]
+                     )
+                elif event == 'DECISION':
+                     # args: type, status, note
+                     self.interface.call_from_thread(
+                        self.log_decision, symbol, args[0], args[1], args[2]
+                     )
+                elif event == 'SUCCESS':
+                     # args: filled, avg, order_id
+                     self.interface.call_from_thread(on_success, args[0], args[1], args[2])
+                elif event == 'FAIL':
+                     self.interface.call_from_thread(on_fail, args[0])
 
+            executor = SmartOrderExecutor(
+                self.exchange, symbol, side, qty, 
+                aggressive=aggressive, 
+                position_side=position_side, 
+                leverage=leverage,
+                callbacks={'on_event': _on_event}
+            )
+            
             try:
-                # Set Leverage if requested
-                if leverage is not None:
-                    self.interface.log_message(f"Setting leverage for {symbol} to {leverage}x")
-                    self.exchange.set_leverage(symbol, leverage)
-
-                start_time = time.time()
-
-                # Loop for chasing (max 70s to allow for the 60s window + buffer)
-                while (time.time() - start_time) < 70:
-                    # 1. Check for Aggressive Switch
-                    if (
-                        not aggressive
-                        and switch_mode_time
-                        and time.time() >= switch_mode_time
-                    ):
-                        aggressive = True
-                        # If we have an active passive order, we need to cancel it first to go aggressive
-                        if order_id:
-                            # The cancellation logic below will handle it in the next loop iteration
-                            # But we can force a 'continue' by ensuring we don't sleep too long
-                            pass
-
-                    # 2. Fetch Price
-                    ticker = self.exchange.get_book_ticker(symbol)
-                    if not ticker:
-                        time.sleep(1)
-                        continue
-
-                    best_bid = float(ticker["bidPrice"])
-                    best_ask = float(ticker["askPrice"])
-
-                    # 3. Determine Price based on Mode
-                    if aggressive:
-                        # Marketable Limit: Buy at Ask+1%, Sell at Bid-1%
-                        price = best_ask * 1.01 if side == "BUY" else best_bid * 0.99
-                        time_in_force = "GTC"
-                    else:
-                        # Chase: Buy at Bid, Sell at Ask (Passive)
-                        price = best_bid if side == "BUY" else best_ask
-                        time_in_force = "GTC"
-
-                    # 4. Place Order if None exists
-                    if not order_id:
-                        # Safety check on Min Qty (approx 5 USDT)
-                        if (qty_left * price) < 5.5:
-                            # Remainder too small, assume done
-                            self.interface.call_from_thread(
-                                on_success, cumulative_filled, price, "Partial-Done"
-                            )
-                            return
-
-                        resp = self.exchange.place_order(
-                            symbol,
-                            side,
-                            "LIMIT",
-                            qty_left,
-                            price,
-                            time_in_force,
-                            position_side=position_side,
-                        )
-                        if resp and "orderId" in resp:
-                            order_id = resp.get("orderId")
-                            self.interface.call_from_thread(
-                                self.log_order_event,
-                                symbol,
-                                order_id,
-                                side,
-                                "LIMIT",
-                                price,
-                                qty_left,
-                                "NEW",
-                                0,
-                                0,
-                                f"Placed ({'Agg' if aggressive else 'Pas'})",
-                            )
-                            if aggressive:
-                                time.sleep(0.5)
-                        else:
-                            self.interface.call_from_thread(
-                                self.log_decision,
-                                symbol,
-                                "EXEC",
-                                "FAIL",
-                                f"Place Error: {resp}",
-                            )
-                            time.sleep(1)
-                            continue
-
-                    # 5. Check Status
-                    status = self.exchange.get_order(symbol, order_id)
-                    if status:
-                        s = status["status"]
-                        # 'executedQty' is cumulative for *this* order_id
-                        this_order_filled = float(status.get("executedQty", 0))
-
-                        # Done?
-                        if s == "FILLED" or (
-                            s == "CANCELED" and this_order_filled >= qty_left * 0.99
-                        ):
-                            cumulative_filled += this_order_filled
-                            avg = float(status.get("avgPrice", price))
-                            if avg == 0 and this_order_filled > 0:
-                                avg = (
-                                    float(status.get("cumQuote", 0)) / this_order_filled
-                                )
-
-                            self.interface.call_from_thread(
-                                self.log_order_event,
-                                symbol,
-                                order_id,
-                                side,
-                                "LIMIT",
-                                price,
-                                qty_left,
-                                s,
-                                this_order_filled,
-                                avg,
-                                "Done",
-                            )
-                            self.interface.call_from_thread(
-                                on_success, cumulative_filled, avg, order_id
-                            )
-                            return
-
-                        # Logic for Chase / Reprice
-                        should_cancel = False
-
-                        # A: Switch to Aggressive?
-                        if (
-                            not aggressive
-                            and switch_mode_time
-                            and time.time() >= switch_mode_time
-                        ):
-                            should_cancel = True
-
-                        # B: Passive Reprice?
-                        elif not aggressive:
-                            current_p = float(status["price"])
-                            new_target = best_bid if side == "BUY" else best_ask
-                            # If price moved away from our limit
-                            if (side == "BUY" and new_target > current_p) or (
-                                side == "SELL" and new_target < current_p
-                            ):
-                                should_cancel = True
-
-                        if should_cancel:
-                            self.interface.call_from_thread(
-                                self.log_order_event,
-                                symbol,
-                                order_id,
-                                side,
-                                "LIMIT",
-                                0,  # price irrelevant here
-                                qty_left,
-                                "CANCEL_REPRICE",
-                                this_order_filled,
-                                0,
-                                "Reprice/Switch",
-                            )
-                            self.exchange.cancel_order(symbol, order_id)
-
-                            # Update State for next loop
-                            cumulative_filled += this_order_filled
-                            qty_left -= this_order_filled
-                            order_id = None
-                            continue
-
-                    time.sleep(1)
-
-                # Timeout / Cleanup
-                if order_id:
-                    self.exchange.cancel_order(symbol, order_id)
-                self.interface.call_from_thread(on_fail, "Timeout")
-
+                executor.run(timeout=70, switch_mode_time=switch_mode_time)
             except Exception as e:
                 self.interface.call_from_thread(on_fail, str(e))
             finally:
