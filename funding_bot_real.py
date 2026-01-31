@@ -73,8 +73,25 @@ class FundingLogic:
         if not os.path.exists("logs/live_trades.csv"):
             with open("logs/live_trades.csv", "w") as f:
                 f.write(
-                    "Timestamp,Strategy,Symbol,Direction,Entry,Exit,Net_PnL_USDT,Net_PnL_Pct,Balance\n"
+                    "Timestamp,Strategy,Symbol,Direction,Entry,Exit,Trade_PnL,Funding,Net_PnL_USDT,Net_PnL_Pct,Balance\n"
                 )
+        else:
+            # Check if header needs update (simple migration)
+            with open("logs/live_trades.csv", "r") as f:
+                header = f.readline().strip()
+            if "Funding" not in header:
+                # Read all, rewrite with new header and default 0.0 for Funding
+                import pandas as pd
+                try:
+                    df = pd.read_csv("logs/live_trades.csv")
+                    df['Trade_PnL'] = df['Net_PnL_USDT'] # Assume old Net was just Trade PnL
+                    df['Funding'] = 0.0
+                    # Reorder
+                    cols = ["Timestamp","Strategy","Symbol","Direction","Entry","Exit","Trade_PnL","Funding","Net_PnL_USDT","Net_PnL_Pct","Balance"]
+                    df = df[cols]
+                    df.to_csv("logs/live_trades.csv", index=False)
+                except Exception as e:
+                    print(f"Failed to migrate CSV: {e}")
 
         # Enhanced Logging for Backtesting
         if not os.path.exists("logs/market_log.csv"):
@@ -88,10 +105,6 @@ class FundingLogic:
                 f.write(
                     "Timestamp,Symbol,OrderId,Side,Type,Price,Qty,Status,ExecutedQty,AvgPrice,Msg\n"
                 )
-
-        if not os.path.exists("logs/decision_log.csv"):
-            with open("logs/decision_log.csv", "w") as f:
-                f.write("Timestamp,Symbol,Strategy,Action,Reason\n")
 
     def log_market_data(self, candidates):
         """Log market snapshot of viable pairs for backtesting."""
@@ -131,11 +144,6 @@ class FundingLogic:
             f.write(
                 f"{datetime.now()},{symbol},{order_id},{side},{type},{price},{qty},{status},{executed},{avg_price},{msg}\n"
             )
-
-    def log_decision(self, symbol, strategy, action, reason):
-        """Log why we did or did not take a trade."""
-        with open("logs/decision_log.csv", "a") as f:
-            f.write(f"{datetime.now()},{symbol},{strategy},{action},{reason}\n")
 
     def start(self):
         self.interface.log_message(f"Starting Logic (Base: {BASE_URL})")
@@ -425,7 +433,6 @@ class FundingLogic:
                 continue
 
             if spread > 0.005:
-                # self.log_decision(sym, "SCAN", "SKIP", f"High Spread {spread:.4f}")
                 continue
 
             # 5. Net Profitability (Rate - Fees - Spread)
@@ -434,7 +441,6 @@ class FundingLogic:
             net_yield = est_profit - spread
 
             if net_yield < MIN_PROFIT_BUFFER:
-                # self.log_decision(sym, "SCAN", "SKIP", f"Low Net Yield ({net_yield:.5f} < {MIN_PROFIT_BUFFER})")
                 continue
 
             candidates.append(
@@ -452,18 +458,47 @@ class FundingLogic:
         self.interface.update_ui()
 
     def log_trade(self, s):
-        # Calc PnL %
+        # Calc Trade PnL (Price Action Only)
+        trade_pnl = 0.0
         if s["entry_price"] > 0:
             if s["direction"] == "LONG":
+                trade_pnl = (s["exit_price"] - s["entry_price"]) * s["quantity"]
                 pnl_pct = (s["exit_price"] - s["entry_price"]) / s["entry_price"]
             else:
+                trade_pnl = (s["entry_price"] - s["exit_price"]) * s["quantity"]
                 pnl_pct = (s["entry_price"] - s["exit_price"]) / s["entry_price"]
         else:
             pnl_pct = 0.0
 
+        # Calc Funding PnL
+        funding_pnl = 0.0
+        # Check if held through funding time
+        ft = s.get("funding_time", 0)
+        et = s.get("entry_time", 0)
+        xt = s.get("exit_time", 0)
+        
+        # If funding time is between entry and exit (with small buffer for latency)
+        if ft > 0 and et < ft and xt > ft:
+            # If rate was positive: Shorts receive, Longs pay.
+            # If rate was negative: Longs receive, Shorts pay.
+            # Strategy matches direction to receive funding, so we should receive abs(rate).
+            # But let's be precise.
+            rate = s.get("funding_rate", 0)
+            position_value = s["entry_price"] * s["quantity"]
+            
+            if s["direction"] == "LONG":
+                # Long pays if rate > 0, receives if rate < 0
+                funding_pnl = position_value * (-rate)
+            else:
+                # Short receives if rate > 0, pays if rate < 0
+                funding_pnl = position_value * (rate)
+
+        total_pnl = trade_pnl + funding_pnl
+        s["net_pnl_amt"] = total_pnl
+
         with open("logs/live_trades.csv", "a") as f:
             f.write(
-                f"{datetime.now()},{s['strategy']},{s['symbol']},{s['direction']},{s['entry_price']},{s['exit_price']},{s.get('net_pnl_amt',0):.4f},{pnl_pct:.6f},{self.balance:.4f}\n"
+                f"{datetime.now()},{s['strategy']},{s['symbol']},{s['direction']},{s['entry_price']},{s['exit_price']},{trade_pnl:.4f},{funding_pnl:.4f},{total_pnl:.4f},{pnl_pct:.6f},{self.balance:.4f}\n"
             )
 
     def remove_pending(self, symbol):
@@ -489,11 +524,6 @@ class FundingLogic:
                      self.interface.call_from_thread(
                         self.log_order_event, symbol, args[0], side, "LIMIT", args[1], args[2], args[3], args[4], args[5], args[6]
                      )
-                elif event == 'DECISION':
-                     # args: type, status, note
-                     self.interface.call_from_thread(
-                        self.log_decision, symbol, args[0], args[1], args[2]
-                     )
                 elif event == 'SUCCESS':
                      # args: filled, avg, order_id
                      self.interface.call_from_thread(on_success, args[0], args[1], args[2])
@@ -518,7 +548,7 @@ class FundingLogic:
         return _worker
 
     def execute_strategy_entry(
-        self, strategy, symbol, direction, maker=False, funding_time_ms=None
+        self, strategy, symbol, direction, maker=False, funding_time_ms=None, funding_rate=0.0
     ):
         # Check duplicates
         for s in self.active_strategies:
@@ -571,6 +601,7 @@ class FundingLogic:
                 "entry_price": avg_price,
                 "entry_time": time.time(),
                 "funding_time": funding_time_ms / 1000.0 if funding_time_ms else 0,
+                "funding_rate": funding_rate,
                 "quantity": fill_qty,
                 "margin": self.trade_size,
                 "order_id": oid,
@@ -667,6 +698,7 @@ class FundingLogic:
                     direction,
                     maker=False,
                     funding_time_ms=cand["next_funding_time"],
+                    funding_rate=cand["funding_rate"],
                 )
 
         # EXIT LOGIC
