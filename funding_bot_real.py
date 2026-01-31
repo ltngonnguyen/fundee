@@ -70,80 +70,11 @@ class FundingLogic:
         self.sim_counter = 0
 
         # Log file
-        if not os.path.exists("logs/live_trades.csv"):
-            with open("logs/live_trades.csv", "w") as f:
+        if not os.path.exists("logs/trade_anchors.csv"):
+            with open("logs/trade_anchors.csv", "w") as f:
                 f.write(
-                    "Timestamp,Strategy,Symbol,Direction,Entry,Exit,Trade_PnL,Funding,Net_PnL_USDT,Net_PnL_Pct,Balance\n"
+                    "Timestamp,Strategy,Symbol,Direction,EntryTime,ExitTime,EntryPrice,ExitPrice,Status,Reason,Quantity\n"
                 )
-        else:
-            # Check if header needs update (simple migration)
-            with open("logs/live_trades.csv", "r") as f:
-                header = f.readline().strip()
-            if "Funding" not in header:
-                # Read all, rewrite with new header and default 0.0 for Funding
-                import pandas as pd
-                try:
-                    df = pd.read_csv("logs/live_trades.csv")
-                    df['Trade_PnL'] = df['Net_PnL_USDT'] # Assume old Net was just Trade PnL
-                    df['Funding'] = 0.0
-                    # Reorder
-                    cols = ["Timestamp","Strategy","Symbol","Direction","Entry","Exit","Trade_PnL","Funding","Net_PnL_USDT","Net_PnL_Pct","Balance"]
-                    df = df[cols]
-                    df.to_csv("logs/live_trades.csv", index=False)
-                except Exception as e:
-                    print(f"Failed to migrate CSV: {e}")
-
-        # Enhanced Logging for Backtesting
-        if not os.path.exists("logs/market_log.csv"):
-            with open("logs/market_log.csv", "w") as f:
-                f.write(
-                    "Timestamp,Symbol,FundingRate,NextFundingTime,Bid,Ask,Spread,EstProfit,MakerFee,TakerFee\n"
-                )
-
-        if not os.path.exists("logs/order_log.csv"):
-            with open("logs/order_log.csv", "w") as f:
-                f.write(
-                    "Timestamp,Symbol,OrderId,Side,Type,Price,Qty,Status,ExecutedQty,AvgPrice,Msg\n"
-                )
-
-    def log_market_data(self, candidates):
-        """Log market snapshot of viable pairs for backtesting."""
-        ts = datetime.now()
-        with open("logs/market_log.csv", "a") as f:
-            for c in candidates:
-                sym = c["symbol"]
-                tik = self.ticker_map.get(sym)
-                if not tik:
-                    continue
-
-                fees = self.fee_cache.get(
-                    sym, {"maker": DEFAULT_MAKER, "taker": DEFAULT_TAKER}
-                )
-                spread = (tik["ask"] - tik["bid"]) / tik["ask"] if tik["ask"] > 0 else 0
-                est_profit = abs(c["funding_rate"]) - (fees["taker"] * 2)
-
-                f.write(
-                    f"{ts},{sym},{c['funding_rate']:.6f},{c['next_funding_time']},{tik['bid']},{tik['ask']},{spread:.6f},{est_profit:.6f},{fees['maker']},{fees['taker']}\n"
-                )
-
-    def log_order_event(
-        self,
-        symbol,
-        order_id,
-        side,
-        type,
-        price,
-        qty,
-        status,
-        executed,
-        avg_price,
-        msg="",
-    ):
-        """Log granular order events."""
-        with open("logs/order_log.csv", "a") as f:
-            f.write(
-                f"{datetime.now()},{symbol},{order_id},{side},{type},{price},{qty},{status},{executed},{avg_price},{msg}\n"
-            )
 
     def start(self):
         self.interface.log_message(f"Starting Logic (Base: {BASE_URL})")
@@ -232,7 +163,7 @@ class FundingLogic:
             qty = abs(amt)
 
             # Define callbacks
-            def _on_success(fill, avg, oid):
+            def _on_success(fill, avg, oid, role):
                 self.interface.notify(
                     f"SAFETY: Killed {symbol} @ {avg}", severity="warning"
                 )
@@ -245,11 +176,6 @@ class FundingLogic:
                         s["exit_price"] = avg
                         s["exit_time"] = time.time()
                         s["reason"] = "Safety Kill"
-                        s["net_pnl_amt"] = (
-                            (avg - s["entry_price"]) * s["quantity"]
-                            if s["direction"] == "LONG"
-                            else (s["entry_price"] - avg) * s["quantity"]
-                        )
                         self.closed_strategies.append(s)
                         found = True
                 if found:
@@ -454,51 +380,21 @@ class FundingLogic:
 
         candidates.sort(key=lambda x: abs(x["funding_rate"]), reverse=True)
         self.viable_pairs = candidates
-        self.log_market_data(candidates)
         self.interface.update_ui()
 
     def log_trade(self, s):
-        # Calc Trade PnL (Price Action Only)
-        trade_pnl = 0.0
-        if s["entry_price"] > 0:
-            if s["direction"] == "LONG":
-                trade_pnl = (s["exit_price"] - s["entry_price"]) * s["quantity"]
-                pnl_pct = (s["exit_price"] - s["entry_price"]) / s["entry_price"]
-            else:
-                trade_pnl = (s["entry_price"] - s["exit_price"]) * s["quantity"]
-                pnl_pct = (s["entry_price"] - s["exit_price"]) / s["entry_price"]
-        else:
-            pnl_pct = 0.0
-
-        # Calc Funding PnL
-        funding_pnl = 0.0
-        # Check if held through funding time
-        ft = s.get("funding_time", 0)
-        et = s.get("entry_time", 0)
-        xt = s.get("exit_time", 0)
+        # Simplified Anchor Logging
+        # We only log the event facts. PnL is analyzed via API later.
         
-        # If funding time is between entry and exit (with small buffer for latency)
-        if ft > 0 and et < ft and xt > ft:
-            # If rate was positive: Shorts receive, Longs pay.
-            # If rate was negative: Longs receive, Shorts pay.
-            # Strategy matches direction to receive funding, so we should receive abs(rate).
-            # But let's be precise.
-            rate = s.get("funding_rate", 0)
-            position_value = s["entry_price"] * s["quantity"]
-            
-            if s["direction"] == "LONG":
-                # Long pays if rate > 0, receives if rate < 0
-                funding_pnl = position_value * (-rate)
-            else:
-                # Short receives if rate > 0, pays if rate < 0
-                funding_pnl = position_value * (rate)
-
-        total_pnl = trade_pnl + funding_pnl
-        s["net_pnl_amt"] = total_pnl
-
-        with open("logs/live_trades.csv", "a") as f:
+        entry_ts = s.get("entry_time", 0)
+        exit_ts = s.get("exit_time", 0)
+        
+        # Convert timestamps to readable string for the CSV timestamp column (Log Time)
+        log_time = datetime.now()
+        
+        with open("logs/trade_anchors.csv", "a") as f:
             f.write(
-                f"{datetime.now()},{s['strategy']},{s['symbol']},{s['direction']},{s['entry_price']},{s['exit_price']},{trade_pnl:.4f},{funding_pnl:.4f},{total_pnl:.4f},{pnl_pct:.6f},{self.balance:.4f}\n"
+                f"{log_time},{s['strategy']},{s['symbol']},{s['direction']},{entry_ts},{exit_ts},{s['entry_price']},{s['exit_price']},{s['status']},{s['reason']},{s['quantity']}\n"
             )
 
     def remove_pending(self, symbol):
@@ -521,12 +417,10 @@ class FundingLogic:
             def _on_event(event, *args):
                 if event == 'ORDER_UPDATE':
                      # args: order_id, price, qty_left, status, filled, avg, note
-                     self.interface.call_from_thread(
-                        self.log_order_event, symbol, args[0], side, "LIMIT", args[1], args[2], args[3], args[4], args[5], args[6]
-                     )
+                     pass
                 elif event == 'SUCCESS':
-                     # args: filled, avg, order_id
-                     self.interface.call_from_thread(on_success, args[0], args[1], args[2])
+                     # args: filled, avg, order_id, role
+                     self.interface.call_from_thread(on_success, args[0], args[1], args[2], args[3])
                 elif event == 'FAIL':
                      self.interface.call_from_thread(on_fail, args[0])
 
@@ -591,7 +485,7 @@ class FundingLogic:
             funding_ts = funding_time_ms / 1000.0
             switch_ts = funding_ts - 29.0
 
-        def _on_success(fill_qty, avg_price, oid):
+        def _on_success(fill_qty, avg_price, oid, role):
             s = {
                 "id": self.sim_counter,
                 "strategy": strategy,
@@ -599,6 +493,7 @@ class FundingLogic:
                 "status": "OPEN",
                 "direction": direction,
                 "entry_price": avg_price,
+                "entry_role": role,
                 "entry_time": time.time(),
                 "funding_time": funding_time_ms / 1000.0 if funding_time_ms else 0,
                 "funding_rate": funding_rate,
@@ -639,25 +534,19 @@ class FundingLogic:
         # Determine Position Side (Hedge Mode Support)
         position_side = s["direction"] if self.is_hedge_mode else None
 
-        def _on_success(fill_qty, avg_price, oid):
+        def _on_success(fill_qty, avg_price, oid, role):
             s["status"] = "CLOSED"
             s["exit_price"] = avg_price
+            s["exit_role"] = role
             s["exit_time"] = time.time()
             s["reason"] = reason
 
-            # PnL Calc (Approx)
-            if s["direction"] == "LONG":
-                pnl = (avg_price - s["entry_price"]) * s["quantity"]
-            else:
-                pnl = (s["entry_price"] - avg_price) * s["quantity"]
-
-            s["net_pnl_amt"] = pnl
             self.closed_strategies.append(s)
             if s in self.active_strategies:
                 self.active_strategies.remove(s)
 
             self.log_trade(s)
-            self.interface.notify(f"CLOSED {s['strategy']} {s['symbol']}: ${pnl:.4f}")
+            self.interface.notify(f"CLOSED {s['strategy']} {s['symbol']}")
             self.interface.update_ui()
 
         def _on_fail(err):

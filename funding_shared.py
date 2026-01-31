@@ -304,8 +304,8 @@ class ExchangeInterface:
                 'User-Agent': 'PythonApp/1.0',
                 'X-MBX-APIKEY': API_KEY
             }
-            # The docs say /fapi/v1/leverage
-            resp = self.session.post(f"{self.base_url}/fapi/v1/leverage", data=query, headers=headers, timeout=10)
+            # The docs say /fapi/v3/leverage
+            resp = self.session.post(f"{self.base_url}/fapi/v3/leverage", data=query, headers=headers, timeout=10)
             return resp.json()
         except Exception as e:
             self.log(f"Set leverage failed: {e}")
@@ -349,7 +349,12 @@ class SmartOrderExecutor:
         # Set Leverage if requested
         if self.leverage is not None:
             self.log(f"Setting leverage for {self.symbol} to {self.leverage}x")
-            self.exchange.set_leverage(self.symbol, self.leverage)
+            res = self.exchange.set_leverage(self.symbol, self.leverage)
+            # Check for success
+            if not res or 'leverage' not in res or int(res['leverage']) != int(self.leverage):
+                 self.log(f"CRITICAL: Failed to set leverage to {self.leverage}x. Response: {res}")
+                 self.emit_event('FAIL', f"Leverage Set Failed: {res}")
+                 return False
 
         start_time = time.time()
 
@@ -387,7 +392,8 @@ class SmartOrderExecutor:
                     # Safety check on Min Qty (approx 5.5 USDT)
                     if (self.qty_left * price) < 5.5:
                         self.log("Remainder too small, marking done.")
-                        self.emit_event('SUCCESS', self.cumulative_filled, price, "Partial-Done")
+                        role = 'TAKER' if self.aggressive else 'MAKER'
+                        self.emit_event('SUCCESS', self.cumulative_filled, price, "Partial-Done", role)
                         return True
 
                     resp = self.exchange.place_order(
@@ -425,7 +431,8 @@ class SmartOrderExecutor:
                             avg = float(status.get("cumQuote", 0)) / this_order_filled
 
                         self.emit_event('ORDER_UPDATE', self.order_id, self.last_price, self.qty_left, s, this_order_filled, avg, "Done")
-                        self.emit_event('SUCCESS', self.cumulative_filled, avg, self.order_id)
+                        role = 'TAKER' if self.aggressive else 'MAKER'
+                        self.emit_event('SUCCESS', self.cumulative_filled, avg, self.order_id, role)
                         return True
 
                     # Logic for Chase / Reprice

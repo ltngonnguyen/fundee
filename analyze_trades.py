@@ -2,288 +2,274 @@ import pandas as pd
 import argparse
 import os
 import sys
-import json
+import time
 from datetime import datetime, timedelta
-import numpy as np
+import threading
+
+# Add current directory to path
+sys.path.append(os.getcwd())
 
 try:
     from rich.console import Console
     from rich.table import Table
     from rich.panel import Panel
     from rich import box
-    from rich.text import Text
+    from rich.progress import Progress, SpinnerColumn, TextColumn
 except ImportError:
     print("Please install 'rich' library: pip install rich")
     sys.exit(1)
 
-console = Console()
+try:
+    from funding_shared import ExchangeInterface
+except ImportError:
+    print("Could not import ExchangeInterface. Make sure funding_shared.py is in the directory.")
+    sys.exit(1)
 
-def load_csv(file_path):
+console = Console()
+exchange = ExchangeInterface()
+
+def load_anchors(file_path):
     if not os.path.exists(file_path):
+        console.print(f"[red]Error: Anchor file '{file_path}' not found.[/red]")
         return None
+    
     try:
         df = pd.read_csv(file_path)
         df.columns = [c.strip() for c in df.columns]
+        # Parse Timestamps
         if 'Timestamp' in df.columns:
-             df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+            df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+        
         return df
-    except: return None
-
-def analyze_order_quality(order_path):
-    df = load_csv(order_path)
-    if df is None or df.empty: return
-    
-    console.print(Panel("[bold yellow]Order Quality Analysis[/bold yellow]", border_style="yellow"))
-    
-    # Fill Rate
-    total_orders = len(df[df['Status'] == 'NEW']) # Assuming 'NEW' marks intent
-    # Or just count unique OrderIds
-    unique_orders = df['OrderId'].nunique()
-    filled = df[df['Status'] == 'FILLED']['OrderId'].nunique()
-    
-    fill_rate = (filled / unique_orders * 100) if unique_orders > 0 else 0
-    
-    # Slippage (AvgPrice vs Price) - Only for Limit orders that filled
-    filled_orders = df[df['Status'] == 'FILLED'].copy()
-    if not filled_orders.empty:
-        # Avoid div by zero
-        filled_orders['Slippage'] = (filled_orders['AvgPrice'] - filled_orders['Price']) / filled_orders['Price'] * 100
-        avg_slippage = filled_orders['Slippage'].abs().mean()
-    else:
-        avg_slippage = 0.0
-
-    grid = Table.grid(expand=True)
-    grid.add_column()
-    grid.add_row("Unique Orders:", str(unique_orders))
-    grid.add_row("Filled Orders:", str(filled))
-    grid.add_row("Fill Rate:", f"{fill_rate:.2f}%")
-    grid.add_row("Avg Slippage:", f"{avg_slippage:.4f}%")
-    console.print(grid)
-
-def analyze_market_opportunities(market_path):
-    df = load_csv(market_path)
-    if df is None or df.empty: return
-    
-    console.print(Panel("[bold cyan]Market Opportunity Analysis[/bold cyan]", border_style="cyan"))
-    
-    # Avg Spread
-    avg_spread = df['Spread'].mean() * 100
-    
-    # Potential Profit
-    avg_est_profit = df['EstProfit'].mean() * 100
-    
-    # Count High Yield Events (> 0.1%)
-    high_yield = df[df['FundingRate'].abs() > 0.001]
-    
-    grid = Table.grid(expand=True)
-    grid.add_column()
-    grid.add_row("Avg Market Spread:", f"{avg_spread:.4f}%")
-    grid.add_row("Avg Est. Profit:", f"{avg_est_profit:.4f}%")
-    grid.add_row("High Yield Events (>0.1%):", str(len(high_yield)))
-    console.print(grid)
-
-def load_trades(file_path):
-    if not os.path.exists(file_path):
-        console.print(f"[red]Error: File '{file_path}' not found.[/red]")
-        return None
-
-    try:
-        df = pd.read_csv(file_path)
     except Exception as e:
-        console.print(f"[red]Error reading file: {e}[/red]")
+        console.print(f"[red]Error reading anchors: {e}[/red]")
         return None
 
-    if df.empty:
-        console.print("[yellow]No trades found in the file.[/yellow]")
-        return None
+def fetch_income_history(start_time_ms, end_time_ms):
+    """
+    Fetches all income history between start and end times.
+    Handles pagination (limit 1000 per call).
+    """
+    all_income = []
+    current_start = start_time_ms
+    
+    # Safety: Don't query future
+    now_ms = int(time.time() * 1000)
+    if end_time_ms > now_ms:
+        end_time_ms = now_ms
 
-    # Clean columns
-    df.columns = [c.strip() for c in df.columns]
-    
-    # Parse Timestamp
-    try:
-        df['Timestamp'] = pd.to_datetime(df['Timestamp'])
-    except Exception as e:
-        console.print(f"[red]Error parsing timestamps: {e}[/red]")
-        return None
-        
-    df = df.sort_values('Timestamp')
-    return df
+    while True:
+        try:
+            params = {
+                'startTime': current_start,
+                'endTime': end_time_ms,
+                'limit': 1000
+            }
+            query = exchange._sign_request(params)
+            headers = {'User-Agent': 'PythonApp/1.0', 'X-MBX-APIKEY': os.getenv("ASTER_API_KEY")}
+            url = f"{exchange.base_url}/fapi/v3/income"
+            
+            resp = exchange.session.get(url, params=query, headers=headers, timeout=20)
+            
+            if resp.status_code != 200:
+                console.print(f"[red]API Error: {resp.status_code} {resp.text}[/red]")
+                break
+                
+            data = resp.json()
+            if not data:
+                break
+                
+            all_income.extend(data)
+            
+            if len(data) < 1000:
+                break
+                
+            # Update cursor
+            # The API might not be strictly sorted by time in a way that allows simple pagination by last time
+            # But usually standard way is last_time + 1. 
+            # Check the last item time
+            last_time = int(data[-1]['time'])
+            if last_time >= end_time_ms:
+                break
+            
+            # Avoid infinite loop if timestamps are same
+            if last_time == current_start:
+                current_start += 1
+            else:
+                current_start = last_time + 1
+                
+        except Exception as e:
+            console.print(f"[red]Exception fetching income: {e}[/red]")
+            break
+            
+    return pd.DataFrame(all_income)
 
-def generate_period_stats(df, period_code, label):
-    # Resample
-    # grouping by period. 
-    # We take the sum of PnL, count of trades.
-    
-    # Set index
-    temp_df = df.set_index('Timestamp')
-    
-    resampler = temp_df.resample(period_code)
-    
-    stats = resampler.agg({
-        'Net_PnL_USDT': 'sum',
-        'Net_PnL_Pct': 'mean', 
-        'Strategy': 'count' # Trade count
-    })
-    
-    # Win rate per period
-    def win_rate(x):
-        if len(x) == 0: return 0.0
-        return (x > 0).sum() / len(x) * 100
-    
-    win_rates = resampler['Net_PnL_USDT'].apply(win_rate)
-    stats['Win_Rate'] = win_rates
-    
-    # Drop empty periods
-    stats = stats[stats['Strategy'] > 0].copy()
-    
-    return stats, label
+def analyze_trades_with_api(file_path):
+    # 1. Load Anchors
+    anchors = load_anchors(file_path)
+    if anchors is None or anchors.empty:
+        console.print("[yellow]No trade anchors found.[/yellow]")
+        return
 
-def print_period_table(stats, title):
-    table = Table(title=title, box=box.SIMPLE_HEAVY, show_lines=True)
-    table.add_column("Period", style="cyan", no_wrap=True)
-    table.add_column("Trades", justify="right")
-    table.add_column("Win Rate", justify="right")
-    table.add_column("PnL (USDT)", justify="right")
+    console.print(Panel(f"[bold blue]Trade Analysis (API-Backed)[/bold blue]\nSource: {file_path}", border_style="blue"))
+
+    # 2. Determine Time Range
+    # We need to cover the earliest entry to the latest exit.
+    # Anchors have EntryTime and ExitTime as float timestamps (seconds).
     
-    for index, row in stats.iterrows():
-        # Colorize PnL
-        pnl = row['Net_PnL_USDT']
-        pnl_str = f"${pnl:.2f}"
-        if pnl > 0: pnl_str = f"[green]+{pnl_str}[/green]"
-        elif pnl < 0: pnl_str = f"[red]{pnl_str}[/red]"
+    min_time = anchors['EntryTime'].min()
+    max_time = anchors['ExitTime'].max()
+    
+    # Buffer: -5 min before, +5 min after
+    start_ms = int((min_time - 300) * 1000)
+    end_ms = int((max_time + 300) * 1000)
+    
+    # 3. Fetch Income Data
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console
+    ) as progress:
+        task = progress.add_task(f"Fetching Income Data from API ({datetime.fromtimestamp(start_ms/1000)} to {datetime.fromtimestamp(end_ms/1000)})...", total=None)
+        income_df = fetch_income_history(start_time_ms=start_ms, end_time_ms=end_ms)
+        progress.update(task, completed=100)
+
+    if income_df.empty:
+        console.print("[red]No income data returned from API. Cannot analyze PnL.[/red]")
+        return
+
+    # Process Income Data
+    income_df['time'] = pd.to_numeric(income_df['time'])
+    income_df['income'] = pd.to_numeric(income_df['income'])
+    
+    # 4. Correlate Anchors with Income
+    # We will add columns to 'anchors' df
+    
+    anchors['Realized_PnL'] = 0.0
+    anchors['Funding_Fee'] = 0.0
+    anchors['Commission'] = 0.0
+    anchors['Net_PnL'] = 0.0
+    
+    matched_income_indices = set()
+
+    # Iterate anchors
+    # For performance, maybe filter income by symbol first
+    
+    for idx, row in anchors.iterrows():
+        symbol = row['Symbol']
+        entry_ts_ms = int(row['EntryTime'] * 1000)
+        exit_ts_ms = int(row['ExitTime'] * 1000)
         
-        # Win Rate color
-        wr = row['Win_Rate']
-        wr_style = "green" if wr >= 50 else "red"
+        # Define window for this specific trade
+        # Loose window: Entry - 2s to Exit + 2s
+        window_start = entry_ts_ms - 2000
+        window_end = exit_ts_ms + 2000
         
-        table.add_row(
-            str(index),
-            str(int(row['Strategy'])),
-            f"[{wr_style}]{wr:.1f}%[/{wr_style}]",
-            pnl_str
+        # Filter income
+        mask = (
+            (income_df['symbol'] == symbol) & 
+            (income_df['time'] >= window_start) & 
+            (income_df['time'] <= window_end)
         )
-    
-    console.print(table)
-
-def print_latest_trades(df, count=50):
-    table = Table(title=f"Latest {count} Trades", box=box.MINIMAL_DOUBLE_HEAD, show_lines=True)
-    table.add_column("Time", style="dim", no_wrap=True)
-    table.add_column("Symbol")
-    table.add_column("Side")
-    table.add_column("Type")
-    table.add_column("Price")
-    table.add_column("Funding")
-    table.add_column("PnL")
-
-    # Sort descending for display
-    latest = df.sort_values('Timestamp', ascending=False).head(count)
-
-    for _, row in latest.iterrows():
-        pnl = row['Net_PnL_USDT']
-        pnl_color = "green" if pnl >= 0 else "red"
         
-        # Handle Funding column if exists
-        funding = row.get('Funding', 0.0)
+        trade_income = income_df[mask]
         
-        table.add_row(
-            row['Timestamp'].strftime('%Y-%m-%d %H:%M:%S'),
-            row['Symbol'],
-            row['Direction'],
-            row['Strategy'],
-            f"{row['Entry']:.4f} -> {row['Exit']:.4f}",
-            f"{funding:.4f}",
-            f"[{pnl_color}]${pnl:.4f}[/{pnl_color}]"
-        )
-    console.print(table)
+        # Calculate components
+        realized = trade_income[trade_income['incomeType'] == 'REALIZED_PNL']['income'].sum()
+        funding = trade_income[trade_income['incomeType'] == 'FUNDING_FEE']['income'].sum()
+        commission = trade_income[trade_income['incomeType'] == 'COMMISSION']['income'].sum()
+        
+        anchors.at[idx, 'Realized_PnL'] = realized
+        anchors.at[idx, 'Funding_Fee'] = funding
+        anchors.at[idx, 'Commission'] = commission
+        anchors.at[idx, 'Net_PnL'] = realized + funding + commission
+        
+        matched_income_indices.update(trade_income.index.tolist())
 
-def analyze_trades(file_path):
-    df = load_trades(file_path)
-    if df is None: return
-
-    # --- Header ---
-    console.print(Panel.fit(f"[bold blue]Trade Performance Analysis[/bold blue]\nFile: {file_path}", border_style="blue"))
-
-    # --- Global Stats ---
-    total_trades = len(df)
-    total_pnl = df['Net_PnL_USDT'].sum()
-    win_rate = (df[df['Net_PnL_USDT'] > 0].shape[0] / total_trades * 100)
+    # 5. Display Statistics
     
-    # Profit Factor
-    gross_win = df[df['Net_PnL_USDT'] > 0]['Net_PnL_USDT'].sum()
-    gross_loss = abs(df[df['Net_PnL_USDT'] < 0]['Net_PnL_USDT'].sum())
-    profit_factor = gross_win / gross_loss if gross_loss > 0 else 999.0
+    # Global Stats
+    total_trades = len(anchors)
+    total_pnl = anchors['Net_PnL'].sum()
+    total_commission = anchors['Commission'].sum()
+    total_funding = anchors['Funding_Fee'].sum()
     
-    # Funding Stats
-    total_funding = df['Funding'].sum() if 'Funding' in df.columns else 0.0
+    winners = anchors[anchors['Net_PnL'] > 0]
+    win_rate = (len(winners) / total_trades * 100) if total_trades > 0 else 0
     
-    # Summary Grid
     grid = Table.grid(expand=True)
     grid.add_column()
     grid.add_column(justify="right")
-    grid.add_row("Total Trades:", f"{total_trades}")
-    grid.add_row("Net PnL:", f"[bold {'green' if total_pnl >=0 else 'red'}]${total_pnl:.2f}[/]")
-    grid.add_row("  - From Trade:", f"${(total_pnl - total_funding):.2f}")
-    grid.add_row("  - From Funding:", f"[bold green]${total_funding:.4f}[/]")
-    grid.add_row("Win Rate:", f"{win_rate:.1f}%")
-    grid.add_row("Profit Factor:", f"{profit_factor:.2f}")
     
-    console.print(Panel(grid, title="Global Statistics", border_style="green"))
-
-    # --- Strategy Breakdown ---
-    strat_table = Table(title="Performance by Strategy", box=box.ROUNDED)
-    strat_table.add_column("Strategy", style="magenta")
+    grid.add_row("Total Trades:", str(total_trades))
+    grid.add_row("Total Net PnL:", f"[bold {'green' if total_pnl >= 0 else 'red'}]${total_pnl:.4f}[/]")
+    grid.add_row("  - Realized PnL:", f"${anchors['Realized_PnL'].sum():.4f}")
+    grid.add_row("  - Funding:", f"[green]${total_funding:.4f}[/green]")
+    grid.add_row("  - Commission:", f"[red]${total_commission:.4f}[/red]")
+    grid.add_row("Win Rate:", f"{win_rate:.2f}%")
+    
+    console.print(Panel(grid, title="Global Statistics (API Verified)", border_style="green"))
+    
+    # Strategy Breakdown
+    strat_table = Table(title="Strategy Performance", box=box.ROUNDED)
+    strat_table.add_column("Strategy")
     strat_table.add_column("Count")
     strat_table.add_column("Win Rate")
-    strat_table.add_column("Total PnL")
+    strat_table.add_column("Net PnL")
     strat_table.add_column("Avg PnL")
     
-    for strat, gdf in df.groupby('Strategy'):
-        cnt = len(gdf)
-        wr = (gdf[gdf['Net_PnL_USDT'] > 0].shape[0] / cnt) * 100
-        tpnl = gdf['Net_PnL_USDT'].sum()
-        apnl = gdf['Net_PnL_USDT'].mean()
+    for strat, gdf in anchors.groupby('Strategy'):
+        count = len(gdf)
+        wr = (len(gdf[gdf['Net_PnL'] > 0]) / count * 100)
+        pnl = gdf['Net_PnL'].sum()
+        avg = gdf['Net_PnL'].mean()
         
         strat_table.add_row(
             strat,
-            str(cnt),
+            str(count),
             f"{wr:.1f}%",
-            f"[{'green' if tpnl>=0 else 'red'}]${tpnl:.2f}[/]",
-            f"${apnl:.2f}"
+            f"[{'green' if pnl>=0 else 'red'}]${pnl:.2f}[/]",
+            f"${avg:.2f}"
         )
     console.print(strat_table)
+    
+    # Detailed List (Latest 20)
+    details = Table(title="Latest Trades", box=box.MINIMAL_DOUBLE_HEAD)
+    details.add_column("Time", style="dim")
+    details.add_column("Symbol")
+    details.add_column("Strategy")
+    details.add_column("Prices (In->Out)")
+    details.add_column("Funding")
+    details.add_column("Comm")
+    details.add_column("Net PnL")
+    
+    for _, row in anchors.sort_values('Timestamp', ascending=False).head(20).iterrows():
+        pnl = row['Net_PnL']
+        color = "green" if pnl >= 0 else "red"
+        
+        details.add_row(
+            row['Timestamp'].strftime('%H:%M:%S'),
+            row['Symbol'],
+            row['Strategy'],
+            f"{row['EntryPrice']:.4f} -> {row['ExitPrice']:.4f}",
+            f"{row['Funding_Fee']:.4f}",
+            f"{row['Commission']:.4f}",
+            f"[{color}]${pnl:.4f}[/{color}]"
+        )
+    console.print(details)
 
-    # --- Time-Based Analysis (3H, 8H, Daily, Weekly) ---
-    console.print("\n[bold yellow]--- Period Analysis ---[/bold yellow]")
-    
-    # 3 Hours
-    stats_3h, _ = generate_period_stats(df, '3h', "3-Hour Performance")
-    print_period_table(stats_3h.tail(8), "Recent 3-Hour Intervals (Last 8)")
-    
-    # 8 Hours
-    stats_8h, _ = generate_period_stats(df, '8h', "8-Hour Performance")
-    print_period_table(stats_8h.tail(6), "Recent 8-Hour Intervals (Last 6)")
-    
-    # Daily
-    stats_1d, _ = generate_period_stats(df, 'D', "Daily Performance")
-    print_period_table(stats_1d.tail(7), "Daily Performance (Last 7 Days)")
+    # Orphaned Income Check (Optional)
+    # Check if there is significant income not matched to anchors (e.g. manual trades or missed logs)
+    # unmatched_income = income_df[~income_df.index.isin(matched_income_indices)]
+    # if not unmatched_income.empty:
+    #     val = unmatched_income['income'].sum()
+    #     if abs(val) > 0.01:
+    #         console.print(f"\n[yellow]Warning: Unmatched Income detected: ${val:.4f} (Manual trades?)[/yellow]")
 
-    # Weekly
-    stats_1w, _ = generate_period_stats(df, 'W', "Weekly Performance")
-    if not stats_1w.empty:
-        print_period_table(stats_1w, "Weekly Performance")
-
-    # --- New Granular Analysis ---
-    base_dir = os.path.dirname(file_path)
-    analyze_market_opportunities(os.path.join(base_dir, "market_log.csv"))
-    analyze_order_quality(os.path.join(base_dir, "order_log.csv"))
-    
-    # --- Latest Trades ---
-    print_latest_trades(df, count=50)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Rich Trade Analysis")
-    parser.add_argument("file", nargs="?", default="logs/live_trades.csv", help="Path to CSV")
+    parser = argparse.ArgumentParser(description="Analyze Trades using API Income History")
+    parser.add_argument("file", nargs="?", default="logs/trade_anchors.csv", help="Path to Anchor CSV")
     args = parser.parse_args()
     
-    analyze_trades(args.file)
+    analyze_trades_with_api(args.file)
