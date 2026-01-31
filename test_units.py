@@ -111,6 +111,92 @@ class TestExchangeInterface(unittest.TestCase):
             self.assertIn('nonce', res)
             self.assertEqual(res['param'], '1')
 
+    def test_get_balance_success(self):
+        # Mock successful response
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = [
+            {'asset': 'BTC', 'availableBalance': '0.5'},
+            {'asset': 'USDT', 'availableBalance': '1000.0'}
+        ]
+        self.exchange.session.get.return_value = mock_resp
+
+        with patch.dict(os.environ, {'ASTER_API_SECRET': 's', 'ASTER_USER_ADDRESS': 'u'}):
+            with patch.object(self.exchange, '_sign_request', return_value={}):
+                bal = self.exchange.get_balance()
+                self.assertEqual(bal, 1000.0)
+                # Verify URL
+                self.exchange.session.get.assert_called()
+                args, kwargs = self.exchange.session.get.call_args
+                self.assertIn('/fapi/v3/balance', args[0])
+
+    def test_get_balance_fail(self):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 400
+        mock_resp.text = "Bad Request"
+        self.exchange.session.get.return_value = mock_resp
+
+        with patch.dict(os.environ, {'ASTER_API_SECRET': 's', 'ASTER_USER_ADDRESS': 'u'}):
+            with patch.object(self.exchange, '_sign_request', return_value={}):
+                bal = self.exchange.get_balance()
+                self.assertIsNone(bal)
+
+    def test_place_order_success(self):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {'orderId': 123}
+        self.exchange.session.post.return_value = mock_resp
+        
+        with patch.dict(os.environ, {'ASTER_API_SECRET': 's'}):
+            with patch.object(self.exchange, '_sign_request', return_value={'signature': 'sig'}):
+                res = self.exchange.place_order('BTCUSDT', 'BUY', 'LIMIT', 0.1, 50000)
+                self.assertEqual(res['orderId'], 123)
+                
+                # Verify params
+                self.exchange.session.post.assert_called()
+                _, kwargs = self.exchange.session.post.call_args
+                data = kwargs['data']
+                self.assertIn('signature', data)
+
+    def test_cancel_order(self):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {'status': 'CANCELED'}
+        self.exchange.session.delete.return_value = mock_resp
+        
+        with patch.dict(os.environ, {'ASTER_API_SECRET': 's'}):
+            with patch.object(self.exchange, '_sign_request', return_value={}):
+                res = self.exchange.cancel_order('BTCUSDT', 123)
+                self.assertEqual(res['status'], 'CANCELED')
+
+    def test_set_leverage(self):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {'leverage': 10}
+        self.exchange.session.post.return_value = mock_resp
+        
+        with patch.dict(os.environ, {'ASTER_API_SECRET': 's'}):
+            with patch.object(self.exchange, '_sign_request', return_value={}):
+                res = self.exchange.set_leverage('BTCUSDT', 10)
+                self.assertEqual(res['leverage'], 10)
+                # Check url
+                args, _ = self.exchange.session.post.call_args
+                self.assertIn('/fapi/v3/leverage', args[0])
+
+    def test_get_position_risk(self):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = [{'symbol': 'BTCUSDT', 'leverage': '10'}]
+        self.exchange.session.get.return_value = mock_resp
+        
+        with patch.dict(os.environ, {'ASTER_API_SECRET': 's', 'ASTER_API_KEY': 'k'}):
+            with patch.object(self.exchange, '_sign_request', return_value={}):
+                res = self.exchange.get_position_risk('BTCUSDT')
+                self.assertEqual(res[0]['symbol'], 'BTCUSDT')
+
+
+
+
 class TestSmartOrderExecutor(unittest.TestCase):
     def setUp(self):
         self.exchange = MagicMock()
