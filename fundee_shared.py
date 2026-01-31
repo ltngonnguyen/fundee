@@ -450,16 +450,25 @@ class SmartOrderExecutor:
                     if not self.aggressive and switch_mode_time and time.time() >= switch_mode_time:
                         should_cancel = True
                     
-                    # B: Price Moved? (Only if Passive)
-                    if not self.aggressive and not should_cancel:
+                    # B: Price Moved? (Reprice if market runs away)
+                    if not should_cancel:
                         current_p = float(status.get("price", self.last_price))
-                        # Check if price moved
-                        # If Buying (Bid), and New Best Bid > Order Price -> We are behind.
-                        if self.side == "BUY" and price > current_p:
-                            should_cancel = True
-                        # If Selling (Ask), and New Best Ask < Order Price -> We are behind.
-                        if self.side == "SELL" and price < current_p:
-                            should_cancel = True
+                        
+                        if self.side == "BUY":
+                            # Passive: If Best Bid > Order Price -> We are behind (chase up)
+                            if not self.aggressive and price > current_p:
+                                should_cancel = True
+                            # Aggressive: If Best Ask > Order Price -> Our 1% buffer was exceeded, we are now a limit order.
+                            elif self.aggressive and best_ask > current_p:
+                                should_cancel = True
+                                
+                        elif self.side == "SELL":
+                            # Passive: If Best Ask < Order Price -> We are behind (chase down)
+                            if not self.aggressive and price < current_p:
+                                should_cancel = True
+                            # Aggressive: If Best Bid < Order Price -> Our 1% buffer was exceeded.
+                            elif self.aggressive and best_bid < current_p:
+                                should_cancel = True
                     
                     if should_cancel:
                         self.log(f"Repricing {self.symbol}: Current Order {current_p} vs Market {price} (Aggressive: {self.aggressive})")

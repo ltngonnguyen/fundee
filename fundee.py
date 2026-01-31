@@ -456,7 +456,7 @@ class FundeeLogic:
             )
             
             try:
-                executor.run(timeout=70, switch_mode_time=switch_mode_time)
+                executor.run(timeout=59, switch_mode_time=switch_mode_time)
             except Exception as e:
                 self.interface.call_from_thread(on_fail, str(e))
             finally:
