@@ -20,11 +20,12 @@ try:
     from textual.containers import Container, Vertical
     from textual.widgets import DataTable, Footer, Header, Log, Static
     from textual.worker import Worker
+    TEXTUAL_INSTALLED = True
 except ImportError:
     # Allow running headless without textual installed
     App = object
     ComposeResult = None
-    pass
+    TEXTUAL_INSTALLED = False
 
 from fundee_shared import BASE_URL, ExchangeInterface, SmartOrderExecutor
 
@@ -857,6 +858,10 @@ if __name__ == "__main__":
     if args.testnet:
         BASE_URL = "https://fapi.asterdex-testnet.com"
         print("WARNING: Using Testnet")
+
+    if not TEXTUAL_INSTALLED and not args.headless:
+        print("Textual library not found. Falling back to headless mode.")
+        args.headless = True
 
     try:
         # Ensure logs directory exists
