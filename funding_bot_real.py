@@ -483,6 +483,7 @@ class FundingLogic:
         leverage=None,
     ):
         def _worker():
+            nonlocal aggressive
             order_id = None
             cumulative_filled = 0.0
             qty_left = qty
