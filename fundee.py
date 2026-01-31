@@ -61,6 +61,7 @@ class FundeeLogic:
         self.ticker_stats_cache = {}
         self.fee_queue = set()
         self.pending_orders = set()
+        self.ignored_dust = set()
         self.is_hedge_mode = False  # Default One-Way
         self.is_fetching_tickers = False  # Prevent stacking requests
 
@@ -125,6 +126,15 @@ class FundeeLogic:
             self.balance = balance
         if positions is not None:
             self.real_positions = positions
+            # Clean up ignored dust if position changed or gone
+            active_symbols = {p['symbol']: float(p['positionAmt']) for p in positions}
+            for sym in list(self.ignored_dust):
+                if sym not in active_symbols:
+                    self.ignored_dust.remove(sym) # Position gone
+                elif abs(active_symbols[sym]) > 0 and abs(active_symbols[sym]) * self.ticker_map.get(sym, {}).get('bid', 0) > 6.0:
+                    # Position grew larger than dust (approx), retry managing it
+                    self.ignored_dust.remove(sym)
+        
         self.interface.update_ui()
 
     def safety_monitor(self):
@@ -151,7 +161,16 @@ class FundeeLogic:
             if amt == 0:
                 continue
             if symbol in self.pending_orders:
+                # Log why we are skipping to aid debugging
+                # But don't spam logs every 5s if it's normal. 
+                # We'll log only if it's been pending for a while? 
+                # For now, just logging at debug level is safest if we had levels, 
+                # but since we print, let's just leave a comment or log if it persists?
+                # The user asked for detailed logs about failure to kill.
+                self.interface.log_message(f"SAFETY: Skipping {symbol} (Already Pending Operation)")
                 continue  # Don't kill if we are already working on it
+            if symbol in self.ignored_dust:
+                continue # Skip known dust
 
             # KILL IT
             self.interface.notify(
@@ -191,6 +210,9 @@ class FundeeLogic:
                     f"SAFETY: Kill failed for {symbol}: {err}", severity="error"
                 )
                 self.remove_pending(symbol)
+                if "Dust Position" in str(err):
+                    self.interface.notify(f"Ignoring Dust: {symbol}", severity="information")
+                    self.ignored_dust.add(symbol)
 
             # Determine Position Side (Hedge Mode Support)
             # If closing a SHORT (amt < 0), pos side is SHORT.
@@ -535,6 +557,12 @@ class FundeeLogic:
         # Determine Position Side (Hedge Mode Support)
         position_side = s["direction"] if self.is_hedge_mode else None
 
+        # Auto-switch to Aggressive if Maker (Passive) takes too long
+        # We give it 30 seconds to fill passively, then we dump it.
+        switch_ts = None
+        if maker:
+            switch_ts = time.time() + 30.0
+
         def _on_success(fill_qty, avg_price, oid, role):
             s["status"] = "CLOSED"
             s["exit_price"] = avg_price
@@ -563,6 +591,7 @@ class FundeeLogic:
                 _on_success,
                 _on_fail,
                 position_side=position_side,
+                switch_mode_time=switch_ts,
             )
         )
 

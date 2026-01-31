@@ -321,6 +321,7 @@ class SmartOrderExecutor:
         self.symbol = symbol
         self.side = side
         self.qty = float(qty)
+        self.initial_qty = self.qty
         self.aggressive = aggressive
         self.position_side = position_side
         self.leverage = leverage
@@ -363,7 +364,7 @@ class SmartOrderExecutor:
                 # 1. Check for Aggressive Switch
                 if not self.aggressive and switch_mode_time and time.time() >= switch_mode_time:
                     self.aggressive = True
-                    self.log(f"Switching to Aggressive Mode for {self.symbol}")
+                    self.log(f"TIMEOUT: Passive limit reached for {self.symbol}. Switching to AGGRESSIVE (Taker).")
                     # If we have an active passive order, we need to cancel it first to go aggressive
                     # We continue; the reprice logic below will handle cancellation if price/mode mismatch
                     pass
@@ -371,6 +372,7 @@ class SmartOrderExecutor:
                 # 2. Fetch Price
                 ticker = self.exchange.get_book_ticker(self.symbol)
                 if not ticker:
+                    self.log(f"Warn: No ticker data for {self.symbol}")
                     time.sleep(1)
                     continue
 
@@ -390,11 +392,17 @@ class SmartOrderExecutor:
                 # 4. Place Order if None exists
                 if not self.order_id:
                     # Safety check on Min Qty (approx 5.5 USDT)
+                    # TODO: Read MIN_NOTIONAL from exchange info if available
                     if (self.qty_left * price) < 5.5:
-                        self.log("Remainder too small, marking done.")
-                        role = 'TAKER' if self.aggressive else 'MAKER'
-                        self.emit_event('SUCCESS', self.cumulative_filled, price, "Partial-Done", role)
-                        return True
+                        if self.qty_left == self.initial_qty:
+                            self.log(f"Position size {self.qty_left} ({self.qty_left*price:.2f} USDT) too small to trade.")
+                            self.emit_event('FAIL', "Dust Position - Too small to close")
+                            return False
+                        else:
+                            self.log("Remainder too small, marking done.")
+                            role = 'TAKER' if self.aggressive else 'MAKER'
+                            self.emit_event('SUCCESS', self.cumulative_filled, price, "Partial-Done", role)
+                            return True
 
                     resp = self.exchange.place_order(
                         self.symbol,
@@ -454,7 +462,7 @@ class SmartOrderExecutor:
                             should_cancel = True
                     
                     if should_cancel:
-                        self.log(f"Repricing {self.symbol}...")
+                        self.log(f"Repricing {self.symbol}: Current Order {current_p} vs Market {price} (Aggressive: {self.aggressive})")
                         self.exchange.cancel_order(self.symbol, self.order_id)
                         # We wait for the next loop to verify cancellation or just clear ID
                         # Ideally, wait for CANCELED status, but to be fast, we just clear ID.
@@ -473,7 +481,7 @@ class SmartOrderExecutor:
                 time.sleep(1)
 
             # Timeout
-            self.log("Timeout reached.")
+            self.log(f"EXECUTION TIMEOUT: Failed to fill {self.symbol} in {timeout}s.")
             if self.order_id:
                 self.exchange.cancel_order(self.symbol, self.order_id)
             self.emit_event('FAIL', "Timeout")

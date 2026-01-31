@@ -13,7 +13,9 @@ from fundee import FundeeLogic
 
 class TestExchangeInterface(unittest.TestCase):
     def setUp(self):
-        self.exchange = ExchangeInterface(base_url="https://mock.url")
+        with patch.object(ExchangeInterface, 'load_exchange_info'):
+            self.exchange = ExchangeInterface(base_url="https://mock.url", logger=MagicMock())
+        
         # Mock the session
         self.exchange.session = MagicMock()
         
