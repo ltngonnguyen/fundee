@@ -385,7 +385,7 @@ class SmartOrderExecutor:
                 else:
                     # Chase: Buy at Bid, Sell at Ask (Passive)
                     price = best_bid if self.side == "BUY" else best_ask
-                    time_in_force = "GTC"
+                    time_in_force = "GTX"  # Post Only to ensure Maker rebate
 
                 # 4. Place Order if None exists
                 if not self.order_id:
