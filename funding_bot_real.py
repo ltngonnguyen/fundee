@@ -902,8 +902,11 @@ class HeadlessInterface:
     def call_from_thread(self, func, *args):
         self.queue.put((func, args))
 
-    def notify(self, msg):
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+    def notify(self, msg, title="", severity="information", timeout=3.0):
+        prefix = ""
+        if severity != "information":
+            prefix = f"[{severity.upper()}] "
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {prefix}{msg}")
         sys.stdout.flush()
 
     def log_message(self, msg):
