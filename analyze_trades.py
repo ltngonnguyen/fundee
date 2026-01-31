@@ -20,9 +20,9 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from funding_shared import ExchangeInterface
+    from fundee_shared import ExchangeInterface
 except ImportError:
-    print("Could not import ExchangeInterface. Make sure funding_shared.py is in the directory.")
+    print("Could not import ExchangeInterface. Make sure fundee_shared.py is in the directory.")
     sys.exit(1)
 
 console = Console()

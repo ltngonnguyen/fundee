@@ -2,9 +2,9 @@ import unittest
 import os
 import time
 import requests
-from funding_shared import ExchangeInterface, BASE_URL
+from fundee_shared import ExchangeInterface, BASE_URL
 
-class TestFundingApp(unittest.TestCase):
+class TestFundeeApp(unittest.TestCase):
     def setUp(self):
         self.exchange = ExchangeInterface()
         # Check for auth
@@ -60,7 +60,7 @@ class TestFundingApp(unittest.TestCase):
             print("\n[TEST] Skipping authenticated tests (No API Keys)")
             return
         
-        from funding_shared import WEB3_AVAILABLE
+        from fundee_shared import WEB3_AVAILABLE
         if not WEB3_AVAILABLE:
             print("\n[TEST] Skipping authenticated tests (Web3 not installed)")
             return

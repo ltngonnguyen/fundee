@@ -26,12 +26,12 @@ except ImportError:
     ComposeResult = None
     pass
 
-from funding_shared import BASE_URL, ExchangeInterface, SmartOrderExecutor
+from fundee_shared import BASE_URL, ExchangeInterface, SmartOrderExecutor
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
-# BASE_URL imported from funding_shared
+# BASE_URL imported from fundee_shared
 
 API_KEY = os.getenv("ASTER_API_KEY")
 API_SECRET = os.getenv("ASTER_API_SECRET")
@@ -45,7 +45,7 @@ DEFAULT_TAKER = 0.0004   # 0.04%
 MIN_PROFIT_BUFFER = 0.0002
 
 
-class FundingLogic:
+class FundeeLogic:
     def __init__(self, interface):
         self.interface = interface
         self.exchange = ExchangeInterface(
@@ -685,7 +685,7 @@ class HeadlessInterface:
         pass
 
     def run(self):
-        self.logic = FundingLogic(self)
+        self.logic = FundeeLogic(self)
         print(
             f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting REAL TRADING Bot (LIVE Mode)..."
         )
@@ -710,7 +710,7 @@ class HeadlessInterface:
             print("\nStopping...")
 
 
-class FundingApp(App):
+class FundeeApp(App):
     CSS = """
     Screen { layout: vertical; }
     DataTable { height: 1fr; border: solid red; } /* Red border for REAL mode */
@@ -727,7 +727,7 @@ class FundingApp(App):
 
     def __init__(self):
         super().__init__()
-        self.logic = FundingLogic(self)
+        self.logic = FundeeLogic(self)
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -866,7 +866,7 @@ if __name__ == "__main__":
         if args.headless:
             HeadlessInterface().run()
         else:
-            app = FundingApp()
+            app = FundeeApp()
             app.run()
 
     finally:
