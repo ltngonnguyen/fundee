@@ -4,3 +4,5 @@ textual
 web3>=6.0.0
 eth-account>=0.8.0
 eth-abi>=4.0.0
+pytest
+coverage
