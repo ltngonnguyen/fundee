@@ -311,11 +311,28 @@ class ExchangeInterface:
             self.log(f"Set leverage failed: {e}")
             return None
 
+    def cancel_all_orders(self, symbol):
+        if not API_SECRET: return None
+        try:
+            params = {'symbol': symbol}
+            query = self._sign_request(params)
+            headers = {'User-Agent': 'PythonApp/1.0'}
+            # Try v1 commonly used for allOpenOrders
+            resp = self.session.delete(f"{self.base_url}/fapi/v1/allOpenOrders", data=query, headers=headers, timeout=10)
+            return resp.json()
+        except Exception as e:
+            self.log(f"Cancel All Orders failed: {e}")
+            return None
+
     def close_all_positions(self, symbol, side, position_side=None):
         """
         Uses STOP_MARKET with closePosition=true to close the entire position (including dust).
         """
         if not API_SECRET: return None
+
+        # 1. Cancel existing orders to free up slots/limits
+        self.cancel_all_orders(symbol)
+        time.sleep(0.5)
         
         # Get Current Price
         ticker = self.get_book_ticker(symbol)
