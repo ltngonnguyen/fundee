@@ -59,6 +59,9 @@ class TestExchangeInterface(unittest.TestCase):
         
         # DOGE: Step 1.0
         self.assertEqual(self.exchange.normalize_quantity('DOGEUSDT', 100.5), 100.0)
+
+        # Dust check: Step 1.0, Qty 0.5 -> Previously 0.0, Now 0.5
+        self.assertEqual(self.exchange.normalize_quantity('DOGEUSDT', 0.5), 0.5)
         
         # Unknown
         self.assertEqual(self.exchange.normalize_quantity('UNKNOWN', 10.55), 10.55)

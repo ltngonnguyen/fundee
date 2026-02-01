@@ -73,7 +73,8 @@ class ExchangeInterface:
         # Use floor to avoid exceeding balance/limits
         normalized = round(math.floor(qty / step_size) * step_size, precision)
         if normalized <= 0 and qty > 0:
-             self.log(f"Quantity {qty} too small for symbol {symbol}. Step size: {step_size}")
+             # self.log(f"Quantity {qty} too small for symbol {symbol}. Step size: {step_size}")
+             return qty
         return normalized
 
     def _trim_dict(self, data):
