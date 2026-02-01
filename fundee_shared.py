@@ -317,8 +317,8 @@ class ExchangeInterface:
             params = {'symbol': symbol}
             query = self._sign_request(params)
             headers = {'User-Agent': 'PythonApp/1.0'}
-            # Try v1 commonly used for allOpenOrders
-            resp = self.session.delete(f"{self.base_url}/fapi/v1/allOpenOrders", data=query, headers=headers, timeout=10)
+            # Try v3 as requested by user
+            resp = self.session.delete(f"{self.base_url}/fapi/v3/allOpenOrders", data=query, headers=headers, timeout=10)
             return resp.json()
         except Exception as e:
             self.log(f"Cancel All Orders failed: {e}")
