@@ -311,6 +311,55 @@ class ExchangeInterface:
             self.log(f"Set leverage failed: {e}")
             return None
 
+    def close_all_positions(self, symbol, side, position_side=None):
+        """
+        Uses STOP_MARKET with closePosition=true to close the entire position (including dust).
+        """
+        if not API_SECRET: return None
+        
+        # Get Current Price
+        ticker = self.get_book_ticker(symbol)
+        if not ticker:
+            self.log(f"Close All Failed: No ticker for {symbol}")
+            return None
+        
+        bid = float(ticker['bidPrice'])
+        ask = float(ticker['askPrice'])
+        
+        # Determine Trigger Price
+        # STOP_MARKET SELL (Close Long): Trigger if Price <= Stop. Set Stop slightly below Bid.
+        # STOP_MARKET BUY (Close Short): Trigger if Price >= Stop. Set Stop slightly above Ask.
+        
+        if side == 'SELL':
+            stop_price = bid * 0.99
+        elif side == 'BUY':
+            stop_price = ask * 1.01
+        else:
+            return None
+
+        params = {
+            'symbol': symbol,
+            'side': side,
+            'type': 'STOP_MARKET',
+            'stopPrice': self.normalize_price(symbol, stop_price),
+            'closePosition': 'true',
+        }
+        if position_side:
+            params['positionSide'] = position_side
+
+        try:
+            query = self._sign_request(params)
+            headers = {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'User-Agent': 'PythonApp/1.0',
+                'X-MBX-APIKEY': API_KEY
+            }
+            resp = self.session.post(f"{self.base_url}/fapi/v3/order", data=query, headers=headers, timeout=10)
+            return resp.json()
+        except Exception as e:
+            self.log(f"Close All failed: {e}")
+            return None
+
 class SmartOrderExecutor:
     """
     Shared logic for smart order execution (Chasing/Passive -> Aggressive).

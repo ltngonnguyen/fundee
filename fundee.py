@@ -218,18 +218,16 @@ class FundeeLogic:
             # If closing a SHORT (amt < 0), pos side is SHORT.
             position_side = direction if self.is_hedge_mode else None
 
-            # Use smart_execute aggressive
-            self.interface.run_worker(
-                self.smart_execute(
-                    symbol,
-                    close_side,
-                    qty,
-                    aggressive=True,
-                    on_success=_on_success,
-                    on_fail=_on_fail,
-                    position_side=position_side,
-                )
-            )
+            # Use close_all_positions (Market Close All) to handle dust safely
+            def _close_worker():
+                res = self.exchange.close_all_positions(symbol, close_side, position_side=position_side)
+                if res and 'orderId' in res:
+                    # Success: Trigger placed
+                    _on_success(0, 0, res['orderId'], "MARKET_CLOSE")
+                else:
+                    _on_fail(str(res))
+
+            self.interface.run_worker(_close_worker)
 
     def fetch_premiums(self):
         self.interface.run_worker(self.fetch_premiums_worker)
