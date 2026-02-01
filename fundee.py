@@ -20,6 +20,7 @@ try:
     from textual.containers import Container, Vertical
     from textual.widgets import DataTable, Footer, Header, Log, Static
     from textual.worker import Worker
+
     TEXTUAL_INSTALLED = True
 except ImportError:
     # Allow running headless without textual installed
@@ -42,7 +43,7 @@ TRADE_SIZE_USDT = 100.0  # Size per trade in USDT
 
 # Defaults
 DEFAULT_MAKER = 0.00005  # 0.005%
-DEFAULT_TAKER = 0.0004   # 0.04%
+DEFAULT_TAKER = 0.0004  # 0.04%
 MIN_PROFIT_BUFFER = 0.0002
 
 
@@ -95,7 +96,7 @@ class FundeeLogic:
         self.interface.set_interval(1.0, self.fetch_tickers)
         self.interface.set_interval(1.0, self.update_strategies)
         self.interface.set_interval(2.0, self.process_fee_queue)
-        self.interface.set_interval(5.0, self.safety_monitor)  # Run safety check every 5s
+        # self.interface.set_interval(5.0, self.safety_monitor)  # Run safety check every 5s, KILLER BOT DEACTIVATOR
         self.refresh_all()
 
     def refresh_all(self):
@@ -127,14 +128,19 @@ class FundeeLogic:
         if positions is not None:
             self.real_positions = positions
             # Clean up ignored dust if position changed or gone
-            active_symbols = {p['symbol']: float(p['positionAmt']) for p in positions}
+            active_symbols = {p["symbol"]: float(p["positionAmt"]) for p in positions}
             for sym in list(self.ignored_dust):
                 if sym not in active_symbols:
-                    self.ignored_dust.remove(sym) # Position gone
-                elif abs(active_symbols[sym]) > 0 and abs(active_symbols[sym]) * self.ticker_map.get(sym, {}).get('bid', 0) > 6.0:
+                    self.ignored_dust.remove(sym)  # Position gone
+                elif (
+                    abs(active_symbols[sym]) > 0
+                    and abs(active_symbols[sym])
+                    * self.ticker_map.get(sym, {}).get("bid", 0)
+                    > 6.0
+                ):
                     # Position grew larger than dust (approx), retry managing it
                     self.ignored_dust.remove(sym)
-        
+
         self.interface.update_ui()
 
     def safety_monitor(self):
@@ -162,15 +168,17 @@ class FundeeLogic:
                 continue
             if symbol in self.pending_orders:
                 # Log why we are skipping to aid debugging
-                # But don't spam logs every 5s if it's normal. 
-                # We'll log only if it's been pending for a while? 
-                # For now, just logging at debug level is safest if we had levels, 
+                # But don't spam logs every 5s if it's normal.
+                # We'll log only if it's been pending for a while?
+                # For now, just logging at debug level is safest if we had levels,
                 # but since we print, let's just leave a comment or log if it persists?
                 # The user asked for detailed logs about failure to kill.
-                self.interface.log_message(f"SAFETY: Skipping {symbol} (Already Pending Operation)")
+                self.interface.log_message(
+                    f"SAFETY: Skipping {symbol} (Already Pending Operation)"
+                )
                 continue  # Don't kill if we are already working on it
             if symbol in self.ignored_dust:
-                continue # Skip known dust
+                continue  # Skip known dust
 
             # KILL IT
             self.interface.notify(
@@ -202,7 +210,7 @@ class FundeeLogic:
                     self.active_strategies = [
                         s for s in self.active_strategies if s["status"] != "CLOSED"
                     ]
-                
+
                 self.sync_balance_positions()
 
             def _on_fail(err):
@@ -211,7 +219,9 @@ class FundeeLogic:
                 )
                 self.remove_pending(symbol)
                 if "Dust Position" in str(err):
-                    self.interface.notify(f"Ignoring Dust: {symbol}", severity="information")
+                    self.interface.notify(
+                        f"Ignoring Dust: {symbol}", severity="information"
+                    )
                     self.ignored_dust.add(symbol)
 
             # Determine Position Side (Hedge Mode Support)
@@ -355,12 +365,18 @@ class FundeeLogic:
 
             # 1. Early Fee Fetching
             # Queue fee fetch for anything with decent funding, so we learn real rates.
-            if abs(rate) > 0.0004 and sym not in self.fee_cache and sym not in self.fee_queue:
+            if (
+                abs(rate) > 0.0004
+                and sym not in self.fee_cache
+                and sym not in self.fee_queue
+            ):
                 self.fee_queue.add(sym)
 
             # 2. Basic Rate Threshold (Using Taker Fees for safety)
             # STRADDLE strategy uses Taker orders.
-            fees = self.fee_cache.get(sym, {"maker": DEFAULT_MAKER, "taker": DEFAULT_TAKER})
+            fees = self.fee_cache.get(
+                sym, {"maker": DEFAULT_MAKER, "taker": DEFAULT_TAKER}
+            )
 
             # Cost = Entry Fee + Exit Fee.
             # We assume Taker for both to be safe during filtering.
@@ -378,7 +394,7 @@ class FundeeLogic:
 
             # 4. Volume Check
             stats = self.ticker_stats_cache.get(sym)
-            if not stats or stats["quoteVolume"] < 500000:  # 500k Min Volume
+            if not stats or stats["quoteVolume"] < 5000000:  # 5000k Min Volume
                 continue
 
             if spread > 0.005:
@@ -408,13 +424,13 @@ class FundeeLogic:
     def log_trade(self, s):
         # Simplified Anchor Logging
         # We only log the event facts. PnL is analyzed via API later.
-        
+
         entry_ts = s.get("entry_time", 0)
         exit_ts = s.get("exit_time", 0)
-        
+
         # Convert timestamps to readable string for the CSV timestamp column (Log Time)
         log_time = datetime.now()
-        
+
         with open("logs/trade_anchors.csv", "a") as f:
             f.write(
                 f"{log_time},{s['strategy']},{s['symbol']},{s['direction']},{entry_ts},{exit_ts},{s['entry_price']},{s['exit_price']},{s['status']},{s['reason']},{s['quantity']}\n"
@@ -438,23 +454,28 @@ class FundeeLogic:
     ):
         def _worker():
             def _on_event(event, *args):
-                if event == 'ORDER_UPDATE':
-                     # args: order_id, price, qty_left, status, filled, avg, note
-                     pass
-                elif event == 'SUCCESS':
-                     # args: filled, avg, order_id, role
-                     self.interface.call_from_thread(on_success, args[0], args[1], args[2], args[3])
-                elif event == 'FAIL':
-                     self.interface.call_from_thread(on_fail, args[0])
+                if event == "ORDER_UPDATE":
+                    # args: order_id, price, qty_left, status, filled, avg, note
+                    pass
+                elif event == "SUCCESS":
+                    # args: filled, avg, order_id, role
+                    self.interface.call_from_thread(
+                        on_success, args[0], args[1], args[2], args[3]
+                    )
+                elif event == "FAIL":
+                    self.interface.call_from_thread(on_fail, args[0])
 
             executor = SmartOrderExecutor(
-                self.exchange, symbol, side, qty, 
-                aggressive=aggressive, 
-                position_side=position_side, 
+                self.exchange,
+                symbol,
+                side,
+                qty,
+                aggressive=aggressive,
+                position_side=position_side,
                 leverage=leverage,
-                callbacks={'on_event': _on_event}
+                callbacks={"on_event": _on_event},
             )
-            
+
             try:
                 executor.run(timeout=59, switch_mode_time=switch_mode_time)
             except Exception as e:
@@ -465,7 +486,13 @@ class FundeeLogic:
         return _worker
 
     def execute_strategy_entry(
-        self, strategy, symbol, direction, maker=False, funding_time_ms=None, funding_rate=0.0
+        self,
+        strategy,
+        symbol,
+        direction,
+        maker=False,
+        funding_time_ms=None,
+        funding_rate=0.0,
     ):
         # Check duplicates
         for s in self.active_strategies:
@@ -601,6 +628,32 @@ class FundeeLogic:
         # ENTRY LOGIC
         for cand in self.viable_pairs:
             symbol = cand["symbol"]
+
+            # 1. JIT VALIDATION (The Fix)
+            # ---------------------------------------------------------
+            ticker = self.ticker_map.get(symbol)
+            if not ticker or ticker["ask"] <= 0:
+                continue
+
+            # Re-calculate real-time spread
+            spread = (ticker["ask"] - ticker["bid"]) / ticker["ask"]
+
+            # Re-calculate real-time costs
+            fees = self.fee_cache.get(
+                symbol, {"maker": DEFAULT_MAKER, "taker": DEFAULT_TAKER}
+            )
+            fee_cost = fees["taker"] * 2  # Assume taker for entry safety
+
+            # Re-calculate profitability
+            net_yield = abs(cand["funding_rate"]) - fee_cost - spread
+
+            # If the market has turned against us in the last 59 seconds, ABORT.
+            if spread > 0.005 or net_yield < MIN_PROFIT_BUFFER:
+                # Optional: Log this rejection so you know the safety check is working
+                # self.interface.log_message(f"Skipping {symbol}: Spread blew out ({spread:.4f})")
+                continue
+            # ---------------------------------------------------------
+
             if not cand["next_funding_time"]:
                 continue
 
