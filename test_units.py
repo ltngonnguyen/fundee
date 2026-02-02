@@ -4,6 +4,7 @@ import time
 import json
 import os
 import sys
+from decimal import Decimal
 
 # Ensure we can import the modules
 sys.path.append(os.getcwd())
@@ -63,8 +64,8 @@ class TestExchangeInterface(unittest.TestCase):
         # Dust check: Step 1.0, Qty 0.5 -> Previously 0.0, Now 0.5
         self.assertEqual(self.exchange.normalize_quantity('DOGEUSDT', 0.5), 0.5)
         
-        # Unknown
-        self.assertEqual(self.exchange.normalize_quantity('UNKNOWN', 10.55), 10.55)
+        # Unknown - should return None for safety
+        self.assertIsNone(self.exchange.normalize_quantity('UNKNOWN', 10.55))
 
     def test_trim_dict(self):
         data = {
@@ -93,8 +94,8 @@ class TestExchangeInterface(unittest.TestCase):
             self.assertIsNone(res)
 
     @patch('fundee_shared.WEB3_AVAILABLE', True)
-    @patch('fundee_shared.Web3')
-    @patch('fundee_shared.Account')
+    @patch('fundee_shared.Web3', create=True)
+    @patch('fundee_shared.Account', create=True)
     def test_sign_request_success(self, mock_account, mock_web3):
         # Setup mocks
         mock_web3.to_checksum_address.side_effect = lambda x: x
@@ -320,11 +321,15 @@ class TestFundeeLogic(unittest.TestCase):
             'ETHUSDT': {'bid': 3000.0, 'ask': 3001.0}
         }
         self.logic.fee_cache = {
-            'BTCUSDT': {'maker': 0.0001, 'taker': 0.0002}
+            'BTCUSDT': {'maker': Decimal('0.0001'), 'taker': Decimal('0.0002')}
         }
         self.logic.ticker_stats_cache = {
-            'BTCUSDT': {'quoteVolume': 1000000},
-            'ETHUSDT': {'quoteVolume': 1000000}
+            'BTCUSDT': {'quoteVolume': 5000000},
+            'ETHUSDT': {'quoteVolume': 5000000}
+        }
+        # Mock exchange precision_map for validation
+        self.logic.exchange.precision_map = {
+            'BTCUSDT': {'tick_size': 0.01, 'step_size': 0.001, 'price_precision': 2, 'qty_precision': 3}
         }
         
     def test_process_premiums_filtering(self):
@@ -362,14 +367,14 @@ class TestFundeeLogic(unittest.TestCase):
             'symbol': 'BTCUSDT',
             'next_funding_time': future_time,
             'direction': 'SHORT',
-            'funding_rate': 0.001
+            'funding_rate': Decimal('0.001')
         }]
         
         # Strategy Logic: "Start 59s before funding. Passive First -> Aggressive at T-29s"
         # 40s is within 29-60s window.
         
         # Balance check
-        self.logic.balance = 200 # Sufficient
+        self.logic.balance = Decimal('200') # Sufficient
         
         self.logic.update_strategies()
         

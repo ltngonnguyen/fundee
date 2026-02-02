@@ -65,16 +65,18 @@ class ExchangeInterface:
         return round(round(price / tick_size) * tick_size, precision)
 
     def normalize_quantity(self, symbol, qty):
-        if symbol not in self.precision_map: return qty
+        if symbol not in self.precision_map: 
+            return None
         p_info = self.precision_map[symbol]
         step_size = p_info['step_size']
         precision = p_info['qty_precision']
-        if step_size == 0: return round(qty, precision)
+        if step_size == 0: 
+            return round(qty, precision)
         # Use floor to avoid exceeding balance/limits
         normalized = round(math.floor(qty / step_size) * step_size, precision)
         if normalized <= 0 and qty > 0:
-             # self.log(f"Quantity {qty} too small for symbol {symbol}. Step size: {step_size}")
-             return qty
+            self.log(f"Quantity {qty} too small for symbol {symbol}. Step size: {step_size}")
+            return None
         return normalized
 
     def _trim_dict(self, data):
@@ -230,7 +232,7 @@ class ExchangeInterface:
         if not API_SECRET: return None
         
         qty = self.normalize_quantity(symbol, quantity)
-        if qty <= 0: 
+        if qty is None or qty <= 0: 
             self.log(f"Invalid Quantity: {qty}")
             return None
 
@@ -282,14 +284,17 @@ class ExchangeInterface:
             headers = {'User-Agent': 'PythonApp/1.0'}
             resp = self.session.get(f"{self.base_url}/fapi/v3/order", params=query, headers=headers, timeout=10)
             return resp.json()
-        except: return None
+        except Exception as e:
+            self.log(f"Get order error: {e}")
+            return None
 
     def get_book_ticker(self, symbol):
         try:
             resp = self.session.get(f"{self.base_url}/fapi/v3/ticker/bookTicker", params={'symbol': symbol}, timeout=10)
             if resp.status_code == 200:
                 return resp.json()
-        except: pass
+        except Exception as e:
+            self.log(f"Book ticker fetch error for {symbol}: {e}")
         return None
 
     def set_leverage(self, symbol, leverage):

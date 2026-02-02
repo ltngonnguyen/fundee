@@ -8,7 +8,9 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from datetime import datetime, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 from queue import Queue
 from urllib.parse import urlencode
 
@@ -38,12 +40,12 @@ API_KEY = os.getenv("ASTER_API_KEY")
 API_SECRET = os.getenv("ASTER_API_SECRET")
 USER_ADDRESS = os.getenv("ASTER_USER_ADDRESS")
 SIGNER_ADDRESS = os.getenv("ASTER_SIGNER_ADDRESS", USER_ADDRESS)
-TRADE_SIZE_USDT = 100.0  # Size per trade in USDT
+TRADE_SIZE_USDT = Decimal("400.0")  # Size per trade in USDT
 
 # Defaults
-DEFAULT_MAKER = 0.00005  # 0.005%
-DEFAULT_TAKER = 0.0004   # 0.04%
-MIN_PROFIT_BUFFER = 0.0002
+DEFAULT_MAKER = Decimal("0.00005")  # 0.005%
+DEFAULT_TAKER = Decimal("0.0004")  # 0.04%
+MIN_PROFIT_BUFFER = Decimal("0.0002")
 
 
 class FundeeLogic:
@@ -52,14 +54,14 @@ class FundeeLogic:
         self.exchange = ExchangeInterface(
             base_url=BASE_URL, logger=self.interface.log_message
         )
-        self.balance = 0.0
+        self.balance = Decimal("0.0")
         self.trade_size = TRADE_SIZE_USDT
 
         self.viable_pairs = []
         self.fee_cache = {}
         self.ticker_map = {}
         self.ticker_stats_cache = {}
-        self.fee_queue = set()
+        self.fee_queue = deque()  # Use deque for ordered processing
         self.pending_orders = set()
         self.ignored_dust = set()
         self.is_hedge_mode = False  # Default One-Way
@@ -68,15 +70,63 @@ class FundeeLogic:
         # Track local strategy state
         self.active_strategies = []
         self.closed_strategies = []
-        self.real_positions = []
         self.sim_counter = 0
 
-        # Log file
-        if not os.path.exists("logs/trade_anchors.csv"):
-            with open("logs/trade_anchors.csv", "w") as f:
-                f.write(
-                    "Timestamp,Strategy,Symbol,Direction,EntryTime,ExitTime,EntryPrice,ExitPrice,Status,Reason,Quantity\n"
-                )
+        # Thread synchronization locks
+        self._ticker_lock = threading.Lock()
+        self._pending_orders_lock = threading.Lock()
+        self._viable_pairs_lock = threading.Lock()
+        self._fee_cache_lock = threading.Lock()
+        self._fetching_tickers_lock = threading.Lock()
+        self._active_strategies_lock = threading.Lock()
+        self._fee_queue_lock = threading.Lock()
+
+        # Log file setup with rotation
+        self._setup_log_file()
+
+    def _setup_log_file(self):
+        """Setup log file with rotation support. Rotates file if > 10MB, keeping only 1 backup."""
+        log_dir = "logs"
+        log_file = os.path.join(log_dir, "trade_anchors.csv")
+        header = "Timestamp,Strategy,Symbol,Direction,EntryTime,ExitTime,EntryPrice,ExitPrice,Status,Reason,Quantity\n"
+        max_size = 10 * 1024 * 1024  # 10MB
+
+        try:
+            # Check if logs directory exists and is writable, create if needed
+            if not os.path.exists(log_dir):
+                os.makedirs(log_dir)
+            
+            if not os.access(log_dir, os.W_OK):
+                self.interface.log_message(f"Error: logs directory is not writable: {log_dir}")
+                return
+
+            # Check if log file exists and its size
+            if os.path.exists(log_file):
+                file_size = os.path.getsize(log_file)
+                
+                # If size > 10MB, rotate it
+                if file_size > max_size:
+                    rotated_file = log_file + ".1"
+                    
+                    # Overwrite existing .1 file if it exists
+                    if os.path.exists(rotated_file):
+                        os.remove(rotated_file)
+                    
+                    os.rename(log_file, rotated_file)
+                    self.interface.log_message(f"Log file rotated: trade_anchors.csv -> trade_anchors.csv.1")
+                    
+                    # Create new file with header
+                    with open(log_file, "w") as f:
+                        f.write(header)
+            else:
+                # File doesn't exist, create it with header
+                with open(log_file, "w") as f:
+                    f.write(header)
+                    
+        except OSError as e:
+            self.interface.log_message(f"Error setting up log file: {e}")
+        except Exception as e:
+            self.interface.log_message(f"Unexpected error in _setup_log_file: {e}")
 
     def start(self):
         self.interface.log_message(f"Starting Logic (Base: {BASE_URL})")
@@ -130,11 +180,17 @@ class FundeeLogic:
             active_symbols = {p['symbol']: float(p['positionAmt']) for p in positions}
             for sym in list(self.ignored_dust):
                 if sym not in active_symbols:
-                    self.ignored_dust.remove(sym) # Position gone
-                elif abs(active_symbols[sym]) > 0 and abs(active_symbols[sym]) * self.ticker_map.get(sym, {}).get('bid', 0) > 6.0:
-                    # Position grew larger than dust (approx), retry managing it
-                    self.ignored_dust.remove(sym)
-        
+                    self.ignored_dust.remove(sym)  # Position gone
+                else:
+                    with self._ticker_lock:
+                        bid = self.ticker_map.get(sym, {}).get("bid", 0)
+                    if (
+                        abs(active_symbols[sym]) > 0
+                        and abs(active_symbols[sym]) * bid > 6.0
+                    ):
+                        # Position grew larger than dust (approx), retry managing it
+                        self.ignored_dust.remove(sym)
+
         self.interface.update_ui()
 
     def safety_monitor(self):
@@ -160,7 +216,9 @@ class FundeeLogic:
 
             if amt == 0:
                 continue
-            if symbol in self.pending_orders:
+            with self._pending_orders_lock:
+                is_pending = symbol in self.pending_orders
+            if is_pending:
                 # Log why we are skipping to aid debugging
                 # But don't spam logs every 5s if it's normal. 
                 # We'll log only if it's been pending for a while? 
@@ -240,8 +298,10 @@ class FundeeLogic:
         self.interface.run_worker(self.fetch_24hr_stats_worker)
 
     def process_fee_queue(self):
-        if self.fee_queue:
-            self.interface.run_worker(self.fetch_fee_worker(self.fee_queue.pop()))
+        with self._fee_queue_lock:
+            if self.fee_queue:
+                symbol = self.fee_queue.popleft()
+                self.interface.run_worker(self.fetch_fee_worker(symbol))
 
     def fetch_premiums_worker(self):
         try:
@@ -262,7 +322,11 @@ class FundeeLogic:
             )
 
     def fetch_tickers_worker(self):
-        self.is_fetching_tickers = True
+        with self._fetching_tickers_lock:
+            if self.is_fetching_tickers:
+                return  # Already fetching, skip this request
+            self.is_fetching_tickers = True
+        
         try:
             # self.interface.call_from_thread(self.interface.log_message, "Fetching tickers...")
             resp = self.exchange.session.get(
@@ -279,7 +343,8 @@ class FundeeLogic:
                 self.interface.log_message, f"Ticker error: {e}"
             )
         finally:
-            self.is_fetching_tickers = False
+            with self._fetching_tickers_lock:
+                self.is_fetching_tickers = False
 
     def fetch_24hr_stats_worker(self):
         try:
@@ -288,8 +353,8 @@ class FundeeLogic:
             )
             if resp.status_code == 200:
                 self.interface.call_from_thread(self.process_24hr_stats, resp.json())
-        except:
-            pass
+        except Exception as e:
+            self.interface.log_message(f"24hr stats fetch error: {e}")
 
     def fetch_fee_worker(self, symbol):
         def _work():
@@ -312,19 +377,20 @@ class FundeeLogic:
                         float(d.get("makerCommissionRate", DEFAULT_MAKER)),
                         float(d.get("takerCommissionRate", DEFAULT_TAKER)),
                     )
-            except:
-                pass
+            except Exception as e:
+                self.interface.log_message(f"Fee fetch error for {symbol}: {e}")
 
         return _work
 
     def process_tickers(self, data):
         if not isinstance(data, list):
             return
-        for t in data:
-            self.ticker_map[t["symbol"]] = {
-                "bid": float(t.get("bidPrice", 0)),
-                "ask": float(t.get("askPrice", 0)),
-            }
+        with self._ticker_lock:
+            for t in data:
+                self.ticker_map[t["symbol"]] = {
+                    "bid": float(t.get("bidPrice", 0)),
+                    "ask": float(t.get("askPrice", 0)),
+                }
         self.interface.update_ui()
 
     def process_24hr_stats(self, data):
@@ -336,7 +402,8 @@ class FundeeLogic:
             }
 
     def update_fee_cache(self, symbol, maker, taker):
-        self.fee_cache[symbol] = {"maker": maker, "taker": taker}
+        with self._fee_cache_lock:
+            self.fee_cache[symbol] = {"maker": Decimal(str(maker)), "taker": Decimal(str(taker))}
 
     def process_premiums(self, data):
         if not isinstance(data, list):
@@ -346,15 +413,21 @@ class FundeeLogic:
         for p in data:
             sym = p["symbol"]
             try:
-                rate = float(p.get("lastFundingRate", 0))
+                rate = Decimal(str(p.get("lastFundingRate", 0)))
                 nxt = p.get("nextFundingTime")
-            except:
+            except (ValueError, TypeError) as e:
+                self.interface.log_message(f"Invalid funding rate data for {sym}: {e}")
                 continue
 
             # 1. Early Fee Fetching
             # Queue fee fetch for anything with decent funding, so we learn real rates.
-            if abs(rate) > 0.0004 and sym not in self.fee_cache and sym not in self.fee_queue:
-                self.fee_queue.add(sym)
+            with self._fee_queue_lock:
+                if (
+                    abs(rate) > Decimal("0.0004")
+                    and sym not in self.fee_cache
+                    and sym not in self.fee_queue
+                ):
+                    self.fee_queue.append(sym)
 
             # 2. Basic Rate Threshold (Using Taker Fees for safety)
             # STRADDLE strategy uses Taker orders.
@@ -368,23 +441,27 @@ class FundeeLogic:
                 continue
 
             # 3. Ticker Data & Spread Check
-            tik = self.ticker_map.get(sym)
-            if not tik or tik["ask"] <= 0:
-                continue  # Skip if no live price data
+            with self._ticker_lock:
+                tik = self.ticker_map.get(sym)
+            if not tik or tik["ask"] <= 0 or tik["bid"] < 0:
+                continue  # Skip if no live price data or invalid prices
 
-            spread = (tik["ask"] - tik["bid"]) / tik["ask"]
+            # Guard against division by zero
+            if tik["ask"] == 0:
+                continue
+            spread = (Decimal(str(tik["ask"])) - Decimal(str(tik["bid"]))) / Decimal(str(tik["ask"]))
 
             # 4. Volume Check
             stats = self.ticker_stats_cache.get(sym)
             if not stats or stats["quoteVolume"] < 500000:  # 500k Min Volume
                 continue
 
-            if spread > 0.005:
+            if spread > Decimal("0.005"):
                 continue
 
             # 5. Net Profitability (Rate - Fees - Spread)
             # We treat Spread as a cost (slippage).
-            est_profit = abs(rate) - fee_cost
+            est_profit = abs(rate) - Decimal(str(fee_cost))
             net_yield = est_profit - spread
 
             if net_yield < MIN_PROFIT_BUFFER:
@@ -400,7 +477,8 @@ class FundeeLogic:
             )
 
         candidates.sort(key=lambda x: abs(x["funding_rate"]), reverse=True)
-        self.viable_pairs = candidates
+        with self._viable_pairs_lock:
+            self.viable_pairs = candidates
         self.interface.update_ui()
 
     def log_trade(self, s):
@@ -419,8 +497,9 @@ class FundeeLogic:
             )
 
     def remove_pending(self, symbol):
-        if symbol in self.pending_orders:
-            self.pending_orders.remove(symbol)
+        with self._pending_orders_lock:
+            if symbol in self.pending_orders:
+                self.pending_orders.remove(symbol)
 
     def smart_execute(
         self,
@@ -466,15 +545,17 @@ class FundeeLogic:
         self, strategy, symbol, direction, maker=False, funding_time_ms=None, funding_rate=0.0
     ):
         # Check duplicates
-        for s in self.active_strategies:
-            if (
-                s["symbol"] == symbol
-                and s["strategy"] == strategy
-                and s["status"] in ["OPEN", "OPENING"]
-            ):
+        with self._active_strategies_lock:
+            for s in self.active_strategies:
+                if (
+                    s["symbol"] == symbol
+                    and s["strategy"] == strategy
+                    and s["status"] in ["OPEN", "OPENING"]
+                ):
+                    return
+        with self._pending_orders_lock:
+            if symbol in self.pending_orders:
                 return
-        if symbol in self.pending_orders:
-            return
 
         if self.balance < self.trade_size:
             self.interface.notify(
@@ -482,12 +563,28 @@ class FundeeLogic:
             )
             return
 
-        ticker = self.ticker_map.get(symbol)
+        with self._ticker_lock:
+            ticker = self.ticker_map.get(symbol)
         if not ticker:
+            self.interface.log_message(f"SKIP {symbol}: No ticker data available")
+            return
+
+        # Validate symbol exists in exchange info
+        if symbol not in self.exchange.precision_map:
+            self.interface.log_message(f"SKIP {symbol}: Symbol not in exchange info")
+            return
+
+        # Validate minimum trade size (5.5 USDT minimum)
+        min_notional = Decimal("5.5")
+        if self.trade_size < min_notional:
+            self.interface.notify(
+                f"SKIP {strategy} {symbol}: Trade size {self.trade_size} below minimum {min_notional} USDT"
+            )
             return
 
         # Mark pending
-        self.pending_orders.add(symbol)
+        with self._pending_orders_lock:
+            self.pending_orders.add(symbol)
 
         # Calculate roughly qty
         price = (
@@ -523,7 +620,8 @@ class FundeeLogic:
                 "order_id": oid,
             }
             self.sim_counter += 1
-            self.active_strategies.append(s)
+            with self._active_strategies_lock:
+                self.active_strategies.append(s)
             self.interface.notify(f"OPENED {strategy} {symbol} @ {avg_price:.4f}")
             self.interface.update_ui()
 
@@ -596,9 +694,42 @@ class FundeeLogic:
     def update_strategies(self):
         current_time = time.time()
 
-        # ENTRY LOGIC
-        for cand in self.viable_pairs:
+        # ENTRY LOGIC - Copy viable_pairs under lock to avoid race conditions
+        with self._viable_pairs_lock:
+            viable_pairs_copy = list(self.viable_pairs)
+        
+        for cand in viable_pairs_copy:
             symbol = cand["symbol"]
+
+            # 1. JIT VALIDATION (The Fix)
+            # ---------------------------------------------------------
+            with self._ticker_lock:
+                ticker = self.ticker_map.get(symbol)
+            if not ticker or ticker["ask"] <= 0 or ticker["bid"] < 0:
+                continue
+
+            # Guard against division by zero
+            if ticker["ask"] == 0:
+                continue
+
+            # Re-calculate real-time spread
+            spread = (Decimal(str(ticker["ask"])) - Decimal(str(ticker["bid"]))) / Decimal(str(ticker["ask"]))
+
+            # Re-calculate real-time costs
+            with self._fee_cache_lock:
+                fees = self.fee_cache.get(symbol, {"maker": DEFAULT_MAKER, "taker": DEFAULT_TAKER})
+            fee_cost = fees["taker"] * 2  # Assume taker for entry safety
+
+            # Re-calculate profitability
+            net_yield = abs(cand["funding_rate"]) - fee_cost - spread
+
+            # If the market has turned against us in the last 59 seconds, ABORT.
+            if spread > Decimal("0.005") or net_yield < MIN_PROFIT_BUFFER:
+                # Optional: Log this rejection so you know the safety check is working
+                # self.interface.log_message(f"Skipping {symbol}: Spread blew out ({spread:.4f})")
+                continue
+            # ---------------------------------------------------------
+
             if not cand["next_funding_time"]:
                 continue
 
@@ -619,15 +750,19 @@ class FundeeLogic:
                 )
 
         # EXIT LOGIC
-        for s in list(self.active_strategies):
+        with self._active_strategies_lock:
+            active_strategies_copy = list(self.active_strategies)
+        for s in active_strategies_copy:
             symbol = s["symbol"]
             strategy = s["strategy"]
 
-            ticker = self.ticker_map.get(symbol)
+            with self._ticker_lock:
+                ticker = self.ticker_map.get(symbol)
             if not ticker:
                 continue
 
-            cand = next((x for x in self.viable_pairs if x["symbol"] == symbol), None)
+            with self._viable_pairs_lock:
+                cand = next((x for x in self.viable_pairs if x["symbol"] == symbol), None)
 
             # TP/SL Logic
             current_price = ticker["bid"] if s["direction"] == "LONG" else ticker["ask"]
@@ -683,16 +818,33 @@ class FundeeLogic:
 
 
 class HeadlessInterface:
+    MAX_WORKERS = 10
+
     def __init__(self):
         self.running = True
         self.tasks = []
         self.queue = Queue()
+        self._active_workers = 0
+        self._workers_lock = threading.Lock()
 
     def set_interval(self, interval, func):
         self.tasks.append([time.time() + interval, interval, func])
 
     def run_worker(self, func, thread=True):
-        t = threading.Thread(target=func)
+        with self._workers_lock:
+            if self._active_workers >= self.MAX_WORKERS:
+                self.log_message(f"WARNING: Max workers ({self.MAX_WORKERS}) reached, skipping task")
+                return
+            self._active_workers += 1
+
+        def _wrapped_worker():
+            try:
+                func()
+            finally:
+                with self._workers_lock:
+                    self._active_workers -= 1
+
+        t = threading.Thread(target=_wrapped_worker)
         t.daemon = True
         t.start()
 
@@ -725,8 +877,8 @@ class HeadlessInterface:
                     try:
                         func, args = self.queue.get_nowait()
                         func(*args)
-                    except:
-                        pass
+                    except Exception as e:
+                        self.log_message(f"Queue processing error: {e}")
 
                 now = time.time()
                 for task in self.tasks:
@@ -739,6 +891,8 @@ class HeadlessInterface:
 
 
 class FundeeApp(App):
+    MAX_WORKERS = 10
+
     CSS = """
     Screen { layout: vertical; }
     DataTable { height: 1fr; border: solid red; } /* Red border for REAL mode */
@@ -756,6 +910,8 @@ class FundeeApp(App):
     def __init__(self):
         super().__init__()
         self.logic = FundeeLogic(self)
+        self._active_workers = 0
+        self._workers_lock = threading.Lock()
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -816,7 +972,20 @@ class FundeeApp(App):
         self.update_sim_table()
 
     def run_worker(self, func, thread=True):
-        return super().run_worker(func, thread=thread)
+        with self._workers_lock:
+            if self._active_workers >= self.MAX_WORKERS:
+                self.log_message(f"WARNING: Max workers ({self.MAX_WORKERS}) reached, skipping task")
+                return
+            self._active_workers += 1
+
+        def _wrapped_worker():
+            try:
+                func()
+            finally:
+                with self._workers_lock:
+                    self._active_workers -= 1
+
+        return super().run_worker(_wrapped_worker, thread=thread)
 
     def update_scanner_table(self):
         table = self.query_one("#scanner_table", DataTable)
@@ -824,7 +993,7 @@ class FundeeApp(App):
         for c in self.logic.viable_pairs[:20]:
             sym = c["symbol"]
             tik = self.logic.ticker_map.get(sym, {"bid": 0, "ask": 0})
-            spr = (tik["ask"] - tik["bid"]) / tik["ask"] if tik["ask"] > 0 else 0
+            spr = (Decimal(str(tik["ask"])) - Decimal(str(tik["bid"]))) / Decimal(str(tik["ask"])) if tik["ask"] > 0 else Decimal("0")
 
             cd = "N/A"
             if c["next_funding_time"]:
