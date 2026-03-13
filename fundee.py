@@ -670,12 +670,17 @@ class FundeeLogic:
                         symbol, side, "MARKET", qty, position_side=position_side
                     )
                     if resp and "orderId" in resp:
-                        _on_success()
+                        _on_success(
+                            Decimal(resp.get("executedQty", qty)),
+                            Decimal(resp.get("avgPrice", 0)),
+                            resp.get("orderId", "MARKET"),
+                            "TAKER",
+                        )
                     else:
-                        _on_fail()
+                        _on_fail(f"Invalid response: {resp}")
                 except Exception as e:
                     self.interface.log_message(f"Market entry error: {e}")
-                    _on_fail()
+                    _on_fail(str(e))
 
             self.interface.run_worker(market_worker)
         else:
@@ -742,12 +747,17 @@ class FundeeLogic:
                         position_side=position_side,
                     )
                     if resp and "orderId" in resp:
-                        _on_success()
+                        _on_success(
+                            Decimal(resp.get("executedQty", s["quantity"])),
+                            Decimal(resp.get("avgPrice", 0)),
+                            resp.get("orderId", "MARKET"),
+                            "TAKER",
+                        )
                     else:
-                        _on_fail()
+                        _on_fail(f"Invalid response: {resp}")
                 except Exception as e:
                     self.interface.log_message(f"Market exit error: {e}")
-                    _on_fail()
+                    _on_fail(str(e))
 
             self.interface.run_worker(market_exit_worker)
         else:
