@@ -575,6 +575,7 @@ class FundeeLogic:
         maker=False,
         funding_time_ms=None,
         funding_rate=0.0,
+        use_market=False,
     ):
         # Check duplicates
         with self._active_strategies_lock:
@@ -660,22 +661,40 @@ class FundeeLogic:
         def _on_fail(reason):
             self.interface.notify(f"OPEN FAIL {symbol}: {reason}")
 
-        self.interface.notify(f"ENTRY {symbol}: Passive first, Aggressive @ T-29s")
-        self.interface.run_worker(
-            self.smart_execute(
-                symbol,
-                side,
-                qty,
-                aggressive=False,  # Start Passive
-                on_success=_on_success,
-                on_fail=_on_fail,
-                position_side=position_side,
-                switch_mode_time=switch_ts,
-                leverage=1,
-            )
-        )
+        if use_market:
+            self.interface.notify(f"ENTRY {symbol}: Pure Market Order (Approach B)")
 
-    def execute_strategy_exit(self, s, reason, maker=False):
+            def market_worker():
+                try:
+                    resp = self.exchange.place_order(
+                        symbol, side, "MARKET", qty, position_side=position_side
+                    )
+                    if resp and "orderId" in resp:
+                        _on_success()
+                    else:
+                        _on_fail()
+                except Exception as e:
+                    self.interface.log_message(f"Market entry error: {e}")
+                    _on_fail()
+
+            self.interface.run_worker(market_worker)
+        else:
+            self.interface.notify(f"ENTRY {symbol}: Passive first, Aggressive @ T-29s")
+            self.interface.run_worker(
+                self.smart_execute(
+                    symbol,
+                    side,
+                    qty,
+                    aggressive=False,  # Start Passive
+                    on_success=_on_success,
+                    on_fail=_on_fail,
+                    position_side=position_side,
+                    switch_mode_time=switch_ts,
+                    leverage=1,
+                )
+            )
+
+    def execute_strategy_exit(self, s, reason, maker=False, use_market=False):
         if s["symbol"] in self.pending_orders:
             return
         self.pending_orders.add(s["symbol"])
@@ -710,18 +729,40 @@ class FundeeLogic:
             self.interface.notify(f"CLOSE FAILED {s['symbol']}: {err}")
 
         self.interface.notify(f"CLOSING {s['strategy']} {s['symbol']} ({reason})...")
-        self.interface.run_worker(
-            self.smart_execute(
-                s["symbol"],
-                side,
-                s["quantity"],
-                not maker,
-                _on_success,
-                _on_fail,
-                position_side=position_side,
-                switch_mode_time=switch_ts,
+
+        if use_market:
+
+            def market_exit_worker():
+                try:
+                    resp = self.exchange.place_order(
+                        s["symbol"],
+                        side,
+                        "MARKET",
+                        s["quantity"],
+                        position_side=position_side,
+                    )
+                    if resp and "orderId" in resp:
+                        _on_success()
+                    else:
+                        _on_fail()
+                except Exception as e:
+                    self.interface.log_message(f"Market exit error: {e}")
+                    _on_fail()
+
+            self.interface.run_worker(market_exit_worker)
+        else:
+            self.interface.run_worker(
+                self.smart_execute(
+                    s["symbol"],
+                    side,
+                    s["quantity"],
+                    not maker,
+                    _on_success,
+                    _on_fail,
+                    position_side=position_side,
+                    switch_mode_time=switch_ts,
+                )
             )
-        )
 
     def update_strategies(self):
         current_time = time.time()
