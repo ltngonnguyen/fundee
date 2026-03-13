@@ -22,6 +22,7 @@ try:
     from textual.containers import Container, Vertical
     from textual.widgets import DataTable, Footer, Header, Log, Static
     from textual.worker import Worker
+
     TEXTUAL_INSTALLED = True
 except ImportError:
     # Allow running headless without textual installed
@@ -41,6 +42,7 @@ API_SECRET = os.getenv("ASTER_API_SECRET")
 USER_ADDRESS = os.getenv("ASTER_USER_ADDRESS")
 SIGNER_ADDRESS = os.getenv("ASTER_SIGNER_ADDRESS", USER_ADDRESS)
 TRADE_SIZE_USDT = Decimal("400.0")  # Size per trade in USDT
+ACTIVE_STRATEGY = "APPROACH_B"  # Options: "STRADDLE", "APPROACH_B"
 
 # Defaults
 DEFAULT_MAKER = Decimal("0.00005")  # 0.005%
@@ -95,26 +97,30 @@ class FundeeLogic:
             # Check if logs directory exists and is writable, create if needed
             if not os.path.exists(log_dir):
                 os.makedirs(log_dir)
-            
+
             if not os.access(log_dir, os.W_OK):
-                self.interface.log_message(f"Error: logs directory is not writable: {log_dir}")
+                self.interface.log_message(
+                    f"Error: logs directory is not writable: {log_dir}"
+                )
                 return
 
             # Check if log file exists and its size
             if os.path.exists(log_file):
                 file_size = os.path.getsize(log_file)
-                
+
                 # If size > 10MB, rotate it
                 if file_size > max_size:
                     rotated_file = log_file + ".1"
-                    
+
                     # Overwrite existing .1 file if it exists
                     if os.path.exists(rotated_file):
                         os.remove(rotated_file)
-                    
+
                     os.rename(log_file, rotated_file)
-                    self.interface.log_message(f"Log file rotated: trade_anchors.csv -> trade_anchors.csv.1")
-                    
+                    self.interface.log_message(
+                        f"Log file rotated: trade_anchors.csv -> trade_anchors.csv.1"
+                    )
+
                     # Create new file with header
                     with open(log_file, "w") as f:
                         f.write(header)
@@ -122,7 +128,7 @@ class FundeeLogic:
                 # File doesn't exist, create it with header
                 with open(log_file, "w") as f:
                     f.write(header)
-                    
+
         except OSError as e:
             self.interface.log_message(f"Error setting up log file: {e}")
         except Exception as e:
@@ -145,7 +151,9 @@ class FundeeLogic:
         self.interface.set_interval(1.0, self.fetch_tickers)
         self.interface.set_interval(1.0, self.update_strategies)
         self.interface.set_interval(2.0, self.process_fee_queue)
-        self.interface.set_interval(5.0, self.safety_monitor)  # Run safety check every 5s
+        self.interface.set_interval(
+            5.0, self.safety_monitor
+        )  # Run safety check every 5s
         self.refresh_all()
 
     def refresh_all(self):
@@ -177,7 +185,7 @@ class FundeeLogic:
         if positions is not None:
             self.real_positions = positions
             # Clean up ignored dust if position changed or gone
-            active_symbols = {p['symbol']: float(p['positionAmt']) for p in positions}
+            active_symbols = {p["symbol"]: float(p["positionAmt"]) for p in positions}
             for sym in list(self.ignored_dust):
                 if sym not in active_symbols:
                     self.ignored_dust.remove(sym)  # Position gone
@@ -220,15 +228,17 @@ class FundeeLogic:
                 is_pending = symbol in self.pending_orders
             if is_pending:
                 # Log why we are skipping to aid debugging
-                # But don't spam logs every 5s if it's normal. 
-                # We'll log only if it's been pending for a while? 
-                # For now, just logging at debug level is safest if we had levels, 
+                # But don't spam logs every 5s if it's normal.
+                # We'll log only if it's been pending for a while?
+                # For now, just logging at debug level is safest if we had levels,
                 # but since we print, let's just leave a comment or log if it persists?
                 # The user asked for detailed logs about failure to kill.
-                self.interface.log_message(f"SAFETY: Skipping {symbol} (Already Pending Operation)")
+                self.interface.log_message(
+                    f"SAFETY: Skipping {symbol} (Already Pending Operation)"
+                )
                 continue  # Don't kill if we are already working on it
             if symbol in self.ignored_dust:
-                continue # Skip known dust
+                continue  # Skip known dust
 
             # KILL IT
             self.interface.notify(
@@ -260,7 +270,7 @@ class FundeeLogic:
                     self.active_strategies = [
                         s for s in self.active_strategies if s["status"] != "CLOSED"
                     ]
-                
+
                 self.sync_balance_positions()
 
             def _on_fail(err):
@@ -269,7 +279,9 @@ class FundeeLogic:
                 )
                 self.remove_pending(symbol)
                 if "Dust Position" in str(err):
-                    self.interface.notify(f"Ignoring Dust: {symbol}", severity="information")
+                    self.interface.notify(
+                        f"Ignoring Dust: {symbol}", severity="information"
+                    )
                     self.ignored_dust.add(symbol)
 
             # Determine Position Side (Hedge Mode Support)
@@ -278,10 +290,12 @@ class FundeeLogic:
 
             # Use close_all_positions (Market Close All) to handle dust safely
             def _close_worker():
-                res = self.exchange.close_all_positions(symbol, close_side, position_side=position_side)
-                if res and 'orderId' in res:
+                res = self.exchange.close_all_positions(
+                    symbol, close_side, position_side=position_side
+                )
+                if res and "orderId" in res:
                     # Success: Trigger placed
-                    _on_success(0, 0, res['orderId'], "MARKET_CLOSE")
+                    _on_success(0, 0, res["orderId"], "MARKET_CLOSE")
                 else:
                     _on_fail(str(res))
 
@@ -326,7 +340,7 @@ class FundeeLogic:
             if self.is_fetching_tickers:
                 return  # Already fetching, skip this request
             self.is_fetching_tickers = True
-        
+
         try:
             # self.interface.call_from_thread(self.interface.log_message, "Fetching tickers...")
             resp = self.exchange.session.get(
@@ -403,7 +417,10 @@ class FundeeLogic:
 
     def update_fee_cache(self, symbol, maker, taker):
         with self._fee_cache_lock:
-            self.fee_cache[symbol] = {"maker": Decimal(str(maker)), "taker": Decimal(str(taker))}
+            self.fee_cache[symbol] = {
+                "maker": Decimal(str(maker)),
+                "taker": Decimal(str(taker)),
+            }
 
     def process_premiums(self, data):
         if not isinstance(data, list):
@@ -431,7 +448,9 @@ class FundeeLogic:
 
             # 2. Basic Rate Threshold (Using Taker Fees for safety)
             # STRADDLE strategy uses Taker orders.
-            fees = self.fee_cache.get(sym, {"maker": DEFAULT_MAKER, "taker": DEFAULT_TAKER})
+            fees = self.fee_cache.get(
+                sym, {"maker": DEFAULT_MAKER, "taker": DEFAULT_TAKER}
+            )
 
             # Cost = Entry Fee + Exit Fee.
             # We assume Taker for both to be safe during filtering.
@@ -449,7 +468,9 @@ class FundeeLogic:
             # Guard against division by zero
             if tik["ask"] == 0:
                 continue
-            spread = (Decimal(str(tik["ask"])) - Decimal(str(tik["bid"]))) / Decimal(str(tik["ask"]))
+            spread = (Decimal(str(tik["ask"])) - Decimal(str(tik["bid"]))) / Decimal(
+                str(tik["ask"])
+            )
 
             # 4. Volume Check
             stats = self.ticker_stats_cache.get(sym)
@@ -484,13 +505,13 @@ class FundeeLogic:
     def log_trade(self, s):
         # Simplified Anchor Logging
         # We only log the event facts. PnL is analyzed via API later.
-        
+
         entry_ts = s.get("entry_time", 0)
         exit_ts = s.get("exit_time", 0)
-        
+
         # Convert timestamps to readable string for the CSV timestamp column (Log Time)
         log_time = datetime.now()
-        
+
         with open("logs/trade_anchors.csv", "a") as f:
             f.write(
                 f"{log_time},{s['strategy']},{s['symbol']},{s['direction']},{entry_ts},{exit_ts},{s['entry_price']},{s['exit_price']},{s['status']},{s['reason']},{s['quantity']}\n"
@@ -515,23 +536,28 @@ class FundeeLogic:
     ):
         def _worker():
             def _on_event(event, *args):
-                if event == 'ORDER_UPDATE':
-                     # args: order_id, price, qty_left, status, filled, avg, note
-                     pass
-                elif event == 'SUCCESS':
-                     # args: filled, avg, order_id, role
-                     self.interface.call_from_thread(on_success, args[0], args[1], args[2], args[3])
-                elif event == 'FAIL':
-                     self.interface.call_from_thread(on_fail, args[0])
+                if event == "ORDER_UPDATE":
+                    # args: order_id, price, qty_left, status, filled, avg, note
+                    pass
+                elif event == "SUCCESS":
+                    # args: filled, avg, order_id, role
+                    self.interface.call_from_thread(
+                        on_success, args[0], args[1], args[2], args[3]
+                    )
+                elif event == "FAIL":
+                    self.interface.call_from_thread(on_fail, args[0])
 
             executor = SmartOrderExecutor(
-                self.exchange, symbol, side, qty, 
-                aggressive=aggressive, 
-                position_side=position_side, 
+                self.exchange,
+                symbol,
+                side,
+                qty,
+                aggressive=aggressive,
+                position_side=position_side,
                 leverage=leverage,
-                callbacks={'on_event': _on_event}
+                callbacks={"on_event": _on_event},
             )
-            
+
             try:
                 executor.run(timeout=59, switch_mode_time=switch_mode_time)
             except Exception as e:
@@ -542,7 +568,13 @@ class FundeeLogic:
         return _worker
 
     def execute_strategy_entry(
-        self, strategy, symbol, direction, maker=False, funding_time_ms=None, funding_rate=0.0
+        self,
+        strategy,
+        symbol,
+        direction,
+        maker=False,
+        funding_time_ms=None,
+        funding_rate=0.0,
     ):
         # Check duplicates
         with self._active_strategies_lock:
@@ -697,7 +729,7 @@ class FundeeLogic:
         # ENTRY LOGIC - Copy viable_pairs under lock to avoid race conditions
         with self._viable_pairs_lock:
             viable_pairs_copy = list(self.viable_pairs)
-        
+
         for cand in viable_pairs_copy:
             symbol = cand["symbol"]
 
@@ -713,11 +745,15 @@ class FundeeLogic:
                 continue
 
             # Re-calculate real-time spread
-            spread = (Decimal(str(ticker["ask"])) - Decimal(str(ticker["bid"]))) / Decimal(str(ticker["ask"]))
+            spread = (
+                Decimal(str(ticker["ask"])) - Decimal(str(ticker["bid"]))
+            ) / Decimal(str(ticker["ask"]))
 
             # Re-calculate real-time costs
             with self._fee_cache_lock:
-                fees = self.fee_cache.get(symbol, {"maker": DEFAULT_MAKER, "taker": DEFAULT_TAKER})
+                fees = self.fee_cache.get(
+                    symbol, {"maker": DEFAULT_MAKER, "taker": DEFAULT_TAKER}
+                )
             fee_cost = fees["taker"] * 2  # Assume taker for entry safety
 
             # Re-calculate profitability
@@ -762,7 +798,9 @@ class FundeeLogic:
                 continue
 
             with self._viable_pairs_lock:
-                cand = next((x for x in self.viable_pairs if x["symbol"] == symbol), None)
+                cand = next(
+                    (x for x in self.viable_pairs if x["symbol"] == symbol), None
+                )
 
             # TP/SL Logic
             current_price = ticker["bid"] if s["direction"] == "LONG" else ticker["ask"]
@@ -801,7 +839,7 @@ class FundeeLogic:
                 s["trailing_active"] = True
                 s["extreme_price"] = current_price
                 self.interface.notify(
-                    f"TRAILING ACTIVATED {s['symbol']} (PnL: {pnl_pct*100:.2f}%)"
+                    f"TRAILING ACTIVATED {s['symbol']} (PnL: {pnl_pct * 100:.2f}%)"
                 )
 
             # Time-based Exit
@@ -833,7 +871,9 @@ class HeadlessInterface:
     def run_worker(self, func, thread=True):
         with self._workers_lock:
             if self._active_workers >= self.MAX_WORKERS:
-                self.log_message(f"WARNING: Max workers ({self.MAX_WORKERS}) reached, skipping task")
+                self.log_message(
+                    f"WARNING: Max workers ({self.MAX_WORKERS}) reached, skipping task"
+                )
                 return
             self._active_workers += 1
 
@@ -974,7 +1014,9 @@ class FundeeApp(App):
     def run_worker(self, func, thread=True):
         with self._workers_lock:
             if self._active_workers >= self.MAX_WORKERS:
-                self.log_message(f"WARNING: Max workers ({self.MAX_WORKERS}) reached, skipping task")
+                self.log_message(
+                    f"WARNING: Max workers ({self.MAX_WORKERS}) reached, skipping task"
+                )
                 return
             self._active_workers += 1
 
@@ -993,7 +1035,12 @@ class FundeeApp(App):
         for c in self.logic.viable_pairs[:20]:
             sym = c["symbol"]
             tik = self.logic.ticker_map.get(sym, {"bid": 0, "ask": 0})
-            spr = (Decimal(str(tik["ask"])) - Decimal(str(tik["bid"]))) / Decimal(str(tik["ask"])) if tik["ask"] > 0 else Decimal("0")
+            spr = (
+                (Decimal(str(tik["ask"])) - Decimal(str(tik["bid"])))
+                / Decimal(str(tik["ask"]))
+                if tik["ask"] > 0
+                else Decimal("0")
+            )
 
             cd = "N/A"
             if c["next_funding_time"]:
@@ -1007,10 +1054,10 @@ class FundeeApp(App):
                 (
                     sym,
                     f"{tik['ask']:.4f}",
-                    f"{c['funding_rate']*100:.4f}%",
+                    f"{c['funding_rate'] * 100:.4f}%",
                     c["direction"],
                     cd,
-                    f"{spr*100:.4f}%",
+                    f"{spr * 100:.4f}%",
                 )
             )
         table.clear()
@@ -1035,8 +1082,8 @@ class FundeeApp(App):
                     s["status"],
                     s["direction"],
                     f"{s['entry_price']:.4f}",
-                    f"{s.get('exit_price',0):.4f}",
-                    f"${s.get('net_pnl_amt',0):.4f}",
+                    f"{s.get('exit_price', 0):.4f}",
+                    f"${s.get('net_pnl_amt', 0):.4f}",
                 )
             )
         table.clear()
