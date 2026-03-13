@@ -820,17 +820,30 @@ class FundeeLogic:
             diff = funding_ts - current_time
             direction = cand["direction"]
 
-            # STRADDLE: Start 59s before funding.
-            # Passive First -> Aggressive at T-29s
-            if 29 < diff <= 60:
-                self.execute_strategy_entry(
-                    "STRADDLE",
-                    symbol,
-                    direction,
-                    maker=False,
-                    funding_time_ms=cand["next_funding_time"],
-                    funding_rate=cand["funding_rate"],
-                )
+            if ACTIVE_STRATEGY == "STRADDLE":
+                # STRADDLE: Start 59s before funding.
+                # Passive First -> Aggressive at T-29s
+                if 29 < diff <= 60:
+                    self.execute_strategy_entry(
+                        "STRADDLE",
+                        symbol,
+                        direction,
+                        maker=False,
+                        funding_time_ms=cand["next_funding_time"],
+                        funding_rate=cand["funding_rate"],
+                    )
+            elif ACTIVE_STRATEGY == "APPROACH_B":
+                # APPROACH B: 1s market in
+                if 0 < diff <= 1:
+                    self.execute_strategy_entry(
+                        "APPROACH_B",
+                        symbol,
+                        direction,
+                        maker=False,
+                        funding_time_ms=cand["next_funding_time"],
+                        funding_rate=cand["funding_rate"],
+                        use_market=True,
+                    )
 
         # EXIT LOGIC
         with self._active_strategies_lock:
@@ -898,6 +911,18 @@ class FundeeLogic:
                     time_since_funding = current_time - funding_time
                     if time_since_funding > 1.0:
                         self.execute_strategy_exit(s, "Post-Funding Exit", maker=True)
+            elif strategy == "APPROACH_B":
+                funding_time = s.get("funding_time", 0)
+                if funding_time > 0:
+                    time_since_funding = current_time - funding_time
+                    # Exit strictly via Market 1s after funding
+                    if time_since_funding > 1.0:
+                        self.execute_strategy_exit(
+                            s,
+                            "Post-Funding Exit (Approach B)",
+                            maker=False,
+                            use_market=True,
+                        )
 
         self.interface.update_ui()
 
