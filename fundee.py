@@ -48,6 +48,8 @@ ACTIVE_STRATEGY = "APPROACH_B"  # Options: "STRADDLE", "APPROACH_B"
 DEFAULT_MAKER = Decimal("0.00005")  # 0.005%
 DEFAULT_TAKER = Decimal("0.0004")  # 0.04%
 MIN_PROFIT_BUFFER = Decimal("0.0002")
+BALANCE_UTILIZATION_PERCENT = Decimal("0.99")
+APPROACH_B_ENTRY_WINDOW = 1.0
 
 
 class FundeeLogic:
@@ -590,7 +592,7 @@ class FundeeLogic:
             if symbol in self.pending_orders:
                 return
 
-        dynamic_trade_size = Decimal(str(self.balance)) * Decimal("0.99")
+        dynamic_trade_size = Decimal(str(self.balance)) * BALANCE_UTILIZATION_PERCENT
 
         # Validate minimum trade size (5.5 USDT minimum)
         min_notional = Decimal("5.5")
@@ -834,7 +836,7 @@ class FundeeLogic:
                     )
             elif ACTIVE_STRATEGY == "APPROACH_B":
                 # APPROACH B: 1s market in
-                if 0 < diff <= 1:
+                if 0 < diff <= APPROACH_B_ENTRY_WINDOW:
                     self.execute_strategy_entry(
                         "APPROACH_B",
                         symbol,
@@ -909,14 +911,14 @@ class FundeeLogic:
                 funding_time = s.get("funding_time", 0)
                 if funding_time > 0:
                     time_since_funding = current_time - funding_time
-                    if time_since_funding > 1.0:
+                    if time_since_funding > APPROACH_B_ENTRY_WINDOW:
                         self.execute_strategy_exit(s, "Post-Funding Exit", maker=True)
             elif strategy == "APPROACH_B":
                 funding_time = s.get("funding_time", 0)
                 if funding_time > 0:
                     time_since_funding = current_time - funding_time
                     # Exit strictly via Market 1s after funding
-                    if time_since_funding > 1.0:
+                    if time_since_funding > APPROACH_B_ENTRY_WINDOW:
                         self.execute_strategy_exit(
                             s,
                             "Post-Funding Exit (Approach B)",

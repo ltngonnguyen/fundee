@@ -66,8 +66,8 @@ class TestExchangeInterface(unittest.TestCase):
         # DOGE: Step 1.0
         self.assertEqual(self.exchange.normalize_quantity("DOGEUSDT", 100.5), 100.0)
 
-        # Dust check: Step 1.0, Qty 0.5 -> Previously 0.0, Now 0.5
-        self.assertEqual(self.exchange.normalize_quantity("DOGEUSDT", 0.5), 0.5)
+        # Dust check: Step 1.0, Qty 0.5 -> Returns None due to minimum size
+        self.assertIsNone(self.exchange.normalize_quantity("DOGEUSDT", 0.5))
 
         # Unknown - should return None for safety
         self.assertIsNone(self.exchange.normalize_quantity("UNKNOWN", 10.55))
@@ -97,19 +97,20 @@ class TestExchangeInterface(unittest.TestCase):
     @patch("fundee_shared.WEB3_AVAILABLE", True)
     @patch("fundee_shared.Web3", create=True)
     @patch("fundee_shared.Account", create=True)
-    def test_sign_request_success(self, mock_account, mock_web3):
+    @patch("fundee_shared.encode", create=True)
+    @patch("fundee_shared.encode_defunct", create=True)
+    def test_sign_request_success(
+        self, mock_encode_defunct, mock_encode, mock_account, mock_web3
+    ):
         # Setup mocks
         mock_web3.to_checksum_address.side_effect = lambda x: x
         mock_web3.keccak.return_value.hex.return_value = "0xdeadbeef"
         mock_account.sign_message.return_value.signature.hex.return_value = "signature"
 
-        with patch.dict(
-            os.environ,
-            {
-                "ASTER_API_KEY": "key",
-                "ASTER_API_SECRET": "0xsecret",
-                "ASTER_USER_ADDRESS": "0xUser",
-            },
+        with (
+            patch("fundee_shared.API_KEY", "key"),
+            patch("fundee_shared.API_SECRET", "0xsecret"),
+            patch("fundee_shared.USER_ADDRESS", "0xUser"),
         ):
             res = self.exchange._sign_request({"param": 1})
 
@@ -129,8 +130,9 @@ class TestExchangeInterface(unittest.TestCase):
         ]
         self.exchange.session.get.return_value = mock_resp
 
-        with patch.dict(
-            os.environ, {"ASTER_API_SECRET": "s", "ASTER_USER_ADDRESS": "u"}
+        with (
+            patch("fundee_shared.API_SECRET", "s"),
+            patch("fundee_shared.USER_ADDRESS", "u"),
         ):
             with patch.object(self.exchange, "_sign_request", return_value={}):
                 bal = self.exchange.get_balance()
@@ -146,8 +148,9 @@ class TestExchangeInterface(unittest.TestCase):
         mock_resp.text = "Bad Request"
         self.exchange.session.get.return_value = mock_resp
 
-        with patch.dict(
-            os.environ, {"ASTER_API_SECRET": "s", "ASTER_USER_ADDRESS": "u"}
+        with (
+            patch("fundee_shared.API_SECRET", "s"),
+            patch("fundee_shared.USER_ADDRESS", "u"),
         ):
             with patch.object(self.exchange, "_sign_request", return_value={}):
                 bal = self.exchange.get_balance()
@@ -159,7 +162,7 @@ class TestExchangeInterface(unittest.TestCase):
         mock_resp.json.return_value = {"orderId": 123}
         self.exchange.session.post.return_value = mock_resp
 
-        with patch.dict(os.environ, {"ASTER_API_SECRET": "s"}):
+        with patch("fundee_shared.API_SECRET", "s"):
             with patch.object(
                 self.exchange, "_sign_request", return_value={"signature": "sig"}
             ):
@@ -178,7 +181,7 @@ class TestExchangeInterface(unittest.TestCase):
         mock_resp.json.return_value = {"status": "CANCELED"}
         self.exchange.session.delete.return_value = mock_resp
 
-        with patch.dict(os.environ, {"ASTER_API_SECRET": "s"}):
+        with patch("fundee_shared.API_SECRET", "s"):
             with patch.object(self.exchange, "_sign_request", return_value={}):
                 res = self.exchange.cancel_order("BTCUSDT", 123)
                 self.assertEqual(res["status"], "CANCELED")
@@ -189,7 +192,7 @@ class TestExchangeInterface(unittest.TestCase):
         mock_resp.json.return_value = {"leverage": 10}
         self.exchange.session.post.return_value = mock_resp
 
-        with patch.dict(os.environ, {"ASTER_API_SECRET": "s"}):
+        with patch("fundee_shared.API_SECRET", "s"):
             with patch.object(self.exchange, "_sign_request", return_value={}):
                 res = self.exchange.set_leverage("BTCUSDT", 10)
                 self.assertEqual(res["leverage"], 10)
@@ -203,7 +206,10 @@ class TestExchangeInterface(unittest.TestCase):
         mock_resp.json.return_value = [{"symbol": "BTCUSDT", "leverage": "10"}]
         self.exchange.session.get.return_value = mock_resp
 
-        with patch.dict(os.environ, {"ASTER_API_SECRET": "s", "ASTER_API_KEY": "k"}):
+        with (
+            patch("fundee_shared.API_SECRET", "s"),
+            patch("fundee_shared.API_KEY", "k"),
+        ):
             with patch.object(self.exchange, "_sign_request", return_value={}):
                 res = self.exchange.get_position_risk("BTCUSDT")
                 self.assertEqual(res[0]["symbol"], "BTCUSDT")
@@ -441,6 +447,116 @@ class TestFundeeLogic(unittest.TestCase):
         # We can check if pending_orders has it
         self.assertIn("BTCUSDT", self.logic.pending_orders)
         self.interface.run_worker.assert_called()
+
+    @patch("fundee.ACTIVE_STRATEGY", "APPROACH_B")
+    def test_approach_b_entry_trigger(self):
+        from fundee import APPROACH_B_ENTRY_WINDOW
+
+        # Setup viable pair close to funding
+        future_time = (
+            time.time() + (APPROACH_B_ENTRY_WINDOW / 2)
+        ) * 1000  # Within 1s window
+        self.logic.viable_pairs = [
+            {
+                "symbol": "BTCUSDT",
+                "next_funding_time": future_time,
+                "direction": "SHORT",
+                "funding_rate": Decimal("0.001"),
+            }
+        ]
+
+        self.logic.balance = Decimal("200")
+
+        # Mock the execute_strategy_entry to check arguments or just let it call and verify internal behavior
+        # But letting it run is fine since it calls run_worker for the market order
+        self.logic.update_strategies()
+
+        self.assertIn("BTCUSDT", self.logic.pending_orders)
+        self.interface.run_worker.assert_called()
+
+        # Verify strategy entry added to active if we let run_worker execute...
+        # Wait, run_worker is a mock, so the inner market_worker doesn't run.
+        # We can extract the worker and run it to verify place_order is called with MARKET.
+        args, _ = self.interface.run_worker.call_args
+        worker_func = args[0]
+
+        # Setup exchange mock
+        self.logic.exchange.place_order = MagicMock(
+            return_value={
+                "orderId": "market123",
+                "executedQty": "0.002",
+                "avgPrice": "50000",
+            }
+        )
+
+        # Run worker
+        worker_func()
+
+        self.logic.exchange.place_order.assert_called_with(
+            "BTCUSDT", "SELL", "MARKET", ANY, position_side=ANY
+        )
+
+        # Verify it got added to active strategies
+        self.assertEqual(len(self.logic.active_strategies), 1)
+        self.assertEqual(self.logic.active_strategies[0]["strategy"], "APPROACH_B")
+        self.assertEqual(self.logic.active_strategies[0]["order_id"], "market123")
+
+    def test_approach_b_exit_trigger(self):
+        from fundee import APPROACH_B_ENTRY_WINDOW
+
+        # Setup active strategy
+        strat = {
+            "id": 1,
+            "strategy": "APPROACH_B",
+            "symbol": "BTCUSDT",
+            "status": "OPEN",
+            "direction": "SHORT",
+            "entry_price": 50000.0,
+            "quantity": 0.002,
+            "funding_time": time.time()
+            - (APPROACH_B_ENTRY_WINDOW + 0.5),  # Time passed
+        }
+        self.logic.active_strategies = [strat]
+        self.logic.viable_pairs = [
+            {
+                "symbol": "BTCUSDT",
+                "direction": "SHORT",
+                "funding_rate": Decimal("0.001"),
+                "next_funding_time": time.time() * 1000,
+            }
+        ]
+
+        self.logic.update_strategies()
+
+        self.assertIn("BTCUSDT", self.logic.pending_orders)
+        self.interface.run_worker.assert_called()
+
+        args, _ = self.interface.run_worker.call_args
+        worker_func = args[0]
+
+        # Setup exchange mock
+        self.logic.exchange.place_order = MagicMock(
+            return_value={
+                "orderId": "exit_market123",
+                "executedQty": "0.002",
+                "avgPrice": "49000",
+            }
+        )
+
+        # Run worker
+        worker_func()
+
+        # Short exit is BUY
+        self.logic.exchange.place_order.assert_called_with(
+            "BTCUSDT", "BUY", "MARKET", 0.002, position_side=ANY
+        )
+
+        # Verify it got closed
+        self.assertEqual(len(self.logic.active_strategies), 0)
+        self.assertEqual(len(self.logic.closed_strategies), 1)
+        self.assertEqual(
+            self.logic.closed_strategies[0]["reason"], "Post-Funding Exit (Approach B)"
+        )
 
     def test_strategy_exit_sl(self):
         # Setup active strategy
