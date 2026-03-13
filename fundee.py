@@ -616,8 +616,8 @@ class FundeeLogic:
             self.pending_orders.add(symbol)
 
         # Calculate roughly qty
-        price = (
-            ticker["ask"] if direction == "LONG" else ticker["bid"]
+        price = Decimal(
+            str(ticker["ask"] if direction == "LONG" else ticker["bid"])
         )  # Approx for sizing
         qty = dynamic_trade_size / price
         side = "BUY" if direction == "LONG" else "SELL"
