@@ -590,9 +590,13 @@ class FundeeLogic:
             if symbol in self.pending_orders:
                 return
 
-        if self.balance < self.trade_size:
+        dynamic_trade_size = Decimal(str(self.balance)) * Decimal("0.99")
+
+        # Validate minimum trade size (5.5 USDT minimum)
+        min_notional = Decimal("5.5")
+        if dynamic_trade_size < min_notional:
             self.interface.notify(
-                f"SKIP {strategy} {symbol}: Low Balance (${self.balance:.2f})"
+                f"SKIP {strategy} {symbol}: Balance too low (99% = ${dynamic_trade_size:.2f} < ${min_notional})"
             )
             return
 
@@ -607,14 +611,6 @@ class FundeeLogic:
             self.interface.log_message(f"SKIP {symbol}: Symbol not in exchange info")
             return
 
-        # Validate minimum trade size (5.5 USDT minimum)
-        min_notional = Decimal("5.5")
-        if self.trade_size < min_notional:
-            self.interface.notify(
-                f"SKIP {strategy} {symbol}: Trade size {self.trade_size} below minimum {min_notional} USDT"
-            )
-            return
-
         # Mark pending
         with self._pending_orders_lock:
             self.pending_orders.add(symbol)
@@ -623,7 +619,7 @@ class FundeeLogic:
         price = (
             ticker["ask"] if direction == "LONG" else ticker["bid"]
         )  # Approx for sizing
-        qty = self.trade_size / price
+        qty = dynamic_trade_size / price
         side = "BUY" if direction == "LONG" else "SELL"
 
         # Determine Position Side (Hedge Mode Support)
@@ -649,7 +645,7 @@ class FundeeLogic:
                 "funding_time": funding_time_ms / 1000.0 if funding_time_ms else 0,
                 "funding_rate": funding_rate,
                 "quantity": fill_qty,
-                "margin": self.trade_size,
+                "margin": dynamic_trade_size,
                 "order_id": oid,
             }
             self.sim_counter += 1
