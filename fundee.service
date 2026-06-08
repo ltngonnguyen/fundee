@@ -1,5 +1,5 @@
 [Unit]
-Description=Fundee Service
+Description=Fundee Service (Hyperliquid)
 After=network.target
 
 [Service]
@@ -7,7 +7,7 @@ Type=simple
 EnvironmentFile=/home/johnd/fundee/.env
 User=johnd
 WorkingDirectory=/home/johnd/fundee
-ExecStart=/home/johnd/fundee/venv/bin/python /home/johnd/fundee/fundee.py --headless
+ExecStart=/home/johnd/fundee/.venv/bin/uv run --env-file /home/johnd/fundee/.env python /home/johnd/fundee/fundee.py --headless
 Restart=always
 RestartSec=5
 
