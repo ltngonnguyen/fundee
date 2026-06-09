@@ -1,0 +1,15 @@
+[Unit]
+Description=Fundee Dry-Run Hypothesis Engine
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/home/johnd/fundee/.env
+User=johnd
+WorkingDirectory=/home/johnd/fundee
+ExecStart=/home/johnd/.local/bin/uv run --env-file /home/johnd/fundee/.env python /home/johnd/fundee/fundee_dryrun.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

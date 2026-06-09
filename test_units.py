@@ -10,6 +10,7 @@ sys.path.append(os.getcwd())
 
 from fundee import FundeeLogic
 from fundee_shared import ExchangeInterface, SmartOrderExecutor
+from fundee_dryrun import SimPosition, PLAYBOOKS
 
 VALID_WALLET = "0x" + "a" * 40
 VALID_KEY = "0x" + "b" * 64
@@ -1291,6 +1292,75 @@ class TestFundeeAppAutokillToggle(unittest.TestCase):
                 self.assertIn("volfilter_off", " ".join(w.classes))
 
         asyncio.run(run())
+
+
+class TestSimPosition(unittest.TestCase):
+    """Tests for simulated position tracking logic in fundee_dryrun."""
+
+    def setUp(self):
+        self.playbook_a = PLAYBOOKS["A"]
+        self.funding_rate = 0.001  # 0.1%
+        self.funding_time = time.time() + 3600
+
+    def test_pnl_calculation_short(self):
+        # Entry at 50000 (SHORT)
+        pos = SimPosition("BTC/USDC:USDC", "A", self.playbook_a, 50000.0, self.funding_rate, self.funding_time)
+        
+        # Price drops to 49500 (1% gain)
+        pos.update(49500.0, 49501.0)
+        self.assertEqual(pos.raw_pnl_pct, 1.0)
+        self.assertEqual(pos.leveraged_pnl_pct, 3.0)  # 3x leverage
+        self.assertEqual(pos.status, "OPEN")
+
+    def test_hard_stop_loss(self):
+        # Entry at 50000, Lev 3x, SL -1.5%
+        # Raw SL = -1.5 / 3 = -0.5%
+        # SL Price = 50000 * (1 - (-0.005)) = 50250
+        pos = SimPosition("BTC/USDC:USDC", "A", self.playbook_a, 50000.0, self.funding_rate, self.funding_time)
+        
+        # Price hits 50250
+        status = pos.update(50250.0, 50251.0)
+        self.assertEqual(status, "CLOSED_SL")
+        self.assertEqual(pos.exit_reason, "CLOSED_SL")
+        self.assertAlmostEqual(pos.leveraged_pnl_pct, -1.5)
+
+    def test_trailing_stop_activation_and_exit(self):
+        # Funding rate 0.1% (0.001)
+        # Trail Trigger = 2.0 * 0.1% = 0.2% (leveraged = 0.2% * 3 = 0.6%? No.)
+        # Wait, SimPosition calculates trigger as:
+        # self.trail_trigger_pct = abs(funding_rate) * 100 * TRAIL_TRIGGER_MULT
+        # = 0.001 * 100 * 2.0 = 0.2% (leveraged PnL trigger)
+        # self.trail_pullback_pct = abs(funding_rate) * 100 * TRAIL_PULLBACK_MULT = 0.1%
+        
+        pos = SimPosition("BTC/USDC:USDC", "A", self.playbook_a, 50000.0, self.funding_rate, self.funding_time)
+        
+        # 1. Reach trigger: Price drops to 49966.67
+        # Raw PnL = (50000 - 49966.67) / 50000 = 0.0006666 = 0.06666%
+        # Lev PnL = 0.2% (Triggered)
+        pos.update(49966.66, 49966.67)
+        self.assertTrue(pos.trail_active)
+        self.assertAlmostEqual(pos.max_leveraged_pnl_pct, 0.2, places=2)
+        
+        # 2. Peak at 49900
+        # Raw PnL = (50000 - 49900) / 50000 = 0.002 = 0.2%
+        # Lev PnL = 0.6%
+        pos.update(49900.0, 49901.0)
+        self.assertAlmostEqual(pos.max_leveraged_pnl_pct, 0.6)
+        
+        # 3. Pullback: Price rises to 49916.67
+        # Raw PnL = (50000 - 49916.67) / 50000 = 0.001666 = 0.1666%
+        # Lev PnL = 0.5%
+        # Pullback = 0.6 - 0.5 = 0.1% (Matches trail_pullback_pct)
+        status = pos.update(49916.67, 49916.68)
+        self.assertEqual(status, "CLOSED_TRAIL")
+        self.assertAlmostEqual(pos.leveraged_pnl_pct, 0.5, places=2)
+
+    def test_expiration_exit(self):
+        funding_time_past = time.time() - 301 # Expired
+        pos = SimPosition("BTC/USDC:USDC", "A", self.playbook_a, 50000.0, self.funding_rate, funding_time_past)
+        
+        status = pos.update(50000.0, 50001.0)
+        self.assertEqual(status, "CLOSED_EXPIRED")
 
 
 if __name__ == "__main__":

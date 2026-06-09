@@ -24,6 +24,7 @@ dev = [
 [project.scripts]
 fundee = "fundee:main"
 fundee-analyze = "analyze_trades:main"
+fundee-dryrun = "fundee_dryrun:main"
 
 [build-system]
 requires = ["hatchling"]
