@@ -1,12 +1,12 @@
 [Unit]
-Description=Fundee Service (Hyperliquid)
+Description=Fundee Dry-Run Hypothesis Engine
 After=network.target
 
 [Service]
 Type=simple
 EnvironmentFile=%h/fundee/.env
 WorkingDirectory=%h/fundee
-ExecStart=/usr/bin/env uv run --env-file %h/fundee/.env python fundee.py --headless
+ExecStart=/usr/bin/env uv run --env-file %h/fundee/.env python fundee_dryrun.py
 Restart=always
 RestartSec=5
 
