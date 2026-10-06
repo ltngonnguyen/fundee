@@ -1,3 +1,4 @@
+import importlib.util
 import os
 import sys
 import time
@@ -9,8 +10,8 @@ from unittest.mock import ANY, MagicMock, patch
 sys.path.append(os.getcwd())
 
 from fundee import FundeeLogic
+from fundee_dryrun import PLAYBOOKS, SimPosition
 from fundee_shared import ExchangeInterface, SmartOrderExecutor
-from fundee_dryrun import SimPosition, PLAYBOOKS
 
 VALID_WALLET = "0x" + "a" * 40
 VALID_KEY = "0x" + "b" * 64
@@ -138,9 +139,8 @@ class TestExchangeInterfaceCCXT(unittest.TestCase):
         patcher = factory.install()
         patcher.start()
         with patch("fundee_shared.HL_WALLET_ADDRESS", None), \
-             patch("fundee_shared.HL_API_PRIVATE_KEY", None):
-            with self.assertRaises(SystemExit):
-                ExchangeInterface(logger=MagicMock())
+             patch("fundee_shared.HL_API_PRIVATE_KEY", None), self.assertRaises(SystemExit):
+            ExchangeInterface(logger=MagicMock())
         patcher.stop()
 
     def test_init_exits_when_creds_empty_string(self):
@@ -148,9 +148,8 @@ class TestExchangeInterfaceCCXT(unittest.TestCase):
         patcher = factory.install()
         patcher.start()
         with patch("fundee_shared.HL_WALLET_ADDRESS", ""), \
-             patch("fundee_shared.HL_API_PRIVATE_KEY", ""):
-            with self.assertRaises(SystemExit):
-                ExchangeInterface(logger=MagicMock())
+             patch("fundee_shared.HL_API_PRIVATE_KEY", ""), self.assertRaises(SystemExit):
+            ExchangeInterface(logger=MagicMock())
         patcher.stop()
 
     # ----- load_markets / precision -----
@@ -266,12 +265,15 @@ class TestExchangeInterfaceCCXT(unittest.TestCase):
     # ----- get_commission_rate -----
 
     def test_get_commission_rate_returns_user_tier(self):
-        # HL has no fetchTradingFees endpoint; we hardcode the user's tier rate.
+        # Fetches per-pair fees via fetch_trading_fee(symbol).
+        self.factory.instance.fetch_trading_fee.return_value = {
+            "maker": 0.00015,
+            "taker": 0.00045,
+        }
         result = self.exchange.get_commission_rate("BTC/USDC:USDC")
-        self.assertEqual(result["maker"], 0.000432)  # 0.0432%
-        self.assertEqual(result["taker"], 0.000144)  # 0.0144%
-        # And we must NOT have called the unsupported endpoint.
-        self.factory.instance.fetch_trading_fees.assert_not_called()
+        self.assertEqual(result["maker"], 0.00015)  # 0.015%
+        self.assertEqual(result["taker"], 0.00045)  # 0.045%
+        self.factory.instance.fetch_trading_fee.assert_called_once_with("BTC/USDC:USDC")
 
     # ----- get_funding_rate -----
 
@@ -536,21 +538,6 @@ class TestNoHedgeMode(unittest.TestCase):
     def test_is_hedge_mode_false(self):
         self.assertFalse(self.logic.is_hedge_mode)
 
-    def test_safety_monitor_does_not_pass_position_side(self):
-        self.logic.exchange.close_all_positions = MagicMock(
-            return_value={"orderId": "x"}
-        )
-        self.logic.real_positions = [
-            {"symbol": "BTC/USDC:USDC", "positionAmt": "0.1"}
-        ]
-        with patch("fundee.datetime") as mock_dt:
-            mock_dt.now.return_value.minute = 0
-            mock_dt.now.return_value.second = 45
-            self.logic.safety_monitor()
-        if self.logic.exchange.close_all_positions.called:
-            call = self.logic.exchange.close_all_positions.call_args
-            self.assertIsNone(call.kwargs.get("position_side"))
-
     def tearDown(self):
         self._exchange_patcher.stop()
 
@@ -796,7 +783,7 @@ class TestFundeeLogic(unittest.TestCase):
         self.assertGreater(baby_cand["net_yield"], 0)
 
     def test_process_premiums_promising_pairs_top5(self):
-        # The promising_pairs list should contain the top 5 by net yield
+        # The promising_pairs list should contain the top pairs by net yield
         # across ALL pairs with valid ticker data — including ones that
         # fail the viability filter.
         data = []
@@ -806,7 +793,7 @@ class TestFundeeLogic(unittest.TestCase):
         for s in syms:
             self.logic.ticker_map[s] = {"bid": 100.0, "ask": 100.05}
             self.logic.ticker_stats_cache[s] = {"quoteVolume": 1000000}
-        for s, r in zip(syms, rates):
+        for s, r in zip(syms, rates, strict=True):
             data.append(
                 {
                     "symbol": s,
@@ -815,11 +802,11 @@ class TestFundeeLogic(unittest.TestCase):
                 }
             )
         self.logic.process_premiums(data)
-        # Top 5 should be the 5 highest rates, all included
-        self.assertEqual(len(self.logic.promising_pairs), 5)
+        # promising_pairs caps at 50; with 7 pairs all are included
+        self.assertEqual(len(self.logic.promising_pairs), 7)
         # Ordered by net_yield descending
         top_syms = [p["symbol"] for p in self.logic.promising_pairs]
-        self.assertEqual(top_syms, syms[:5])
+        self.assertEqual(top_syms, syms)
         # Each has the required keys
         for p in self.logic.promising_pairs:
             self.assertIn("funding_rate", p)
@@ -1087,69 +1074,8 @@ class TestFundeeLogic(unittest.TestCase):
         self.interface.run_worker.assert_called()
         self.assertIn("BTCUSDT", self.logic.pending_orders)
 
-    def test_safety_monitor_kill(self):
-        # Logic: If xx:xx:01 to xx:xx:29 (Funding window) -> Safe
-        # If xx:xx:31 -> Kill
-
-        # Let's mock datetime in fundee.py?
-        # Or just manually set self.real_positions and call safety_monitor with mocked datetime
-
-        self.logic.real_positions = [
-            {"symbol": "BTCUSDT", "positionAmt": "0.1"}  # Lingering position
-        ]
-
-        with patch("fundee.datetime") as mock_dt:
-            # Set time to Minute: 0, Second: 45 (Outside safe zone 0-30 and 59)
-            mock_dt.now.return_value.minute = 0
-            mock_dt.now.return_value.second = 45
-
-            self.logic.safety_monitor()
-
-            # Should trigger kill
-            self.interface.notify.assert_called_with(ANY, severity="warning")
-            self.assertIn("BTCUSDT", self.logic.pending_orders)
-            self.interface.run_worker.assert_called()
-
-    def test_safety_monitor_skips_when_autokill_disabled(self):
-        self.logic.autokill_enabled = False
-        self.logic.real_positions = [
-            {"symbol": "BTCUSDT", "positionAmt": "0.1"}  # Lingering position
-        ]
-        with patch("fundee.datetime") as mock_dt:
-            mock_dt.now.return_value.minute = 0
-            mock_dt.now.return_value.second = 45  # outside safe zone
-            self.logic.safety_monitor()
-        # No kill, no pending order, no worker.
-        self.interface.run_worker.assert_not_called()
-        self.assertNotIn("BTCUSDT", self.logic.pending_orders)
-        # Safety zone should NOT have been notified either (the function is a no-op).
-        self.interface.notify.assert_not_called()
-
-    def test_safety_monitor_runs_when_autokill_enabled(self):
-        # Sanity: default behavior preserved when autokill is on.
-        self.logic.autokill_enabled = True
-        self.logic.real_positions = [
-            {"symbol": "BTCUSDT", "positionAmt": "0.1"}
-        ]
-        with patch("fundee.datetime") as mock_dt:
-            mock_dt.now.return_value.minute = 0
-            mock_dt.now.return_value.second = 45
-            self.logic.safety_monitor()
-        self.interface.run_worker.assert_called()
-        self.assertIn("BTCUSDT", self.logic.pending_orders)
-
-    def test_fundee_logic_default_autokill_is_on(self):
-        # Fresh instance — default must be enabled (safety-first).
-        with patch("fundee.ExchangeInterface") as mock_ei:
-            mock_ei.return_value = MagicMock()
-            logic = FundeeLogic(MagicMock())
-        self.assertTrue(logic.autokill_enabled)
-
-    def test_fundee_logic_autokill_false_via_ctor(self):
-        with patch("fundee.ExchangeInterface") as mock_ei:
-            mock_ei.return_value = MagicMock()
-            logic = FundeeLogic(MagicMock(), autokill=False)
-        self.assertFalse(logic.autokill_enabled)
+    def tearDown(self):
+        self._exchange_patcher.stop()
 
     def test_fundee_logic_volume_filter_defaults_on(self):
         with patch("fundee.ExchangeInterface") as mock_ei:
@@ -1203,27 +1129,25 @@ class TestFundeeLogic(unittest.TestCase):
         viable_syms = [x["symbol"] for x in self.logic.viable_pairs]
         self.assertNotIn("DUSTUSDT", viable_syms)
 
-    def tearDown(self):
-        self._exchange_patcher.stop()
 
-
-class TestFundeeAppAutokillToggle(unittest.TestCase):
-    """TUI-level test: pressing 'k' toggles the autokill state and the indicator widget."""
+@unittest.skipUnless(
+    importlib.util.find_spec("textual") is not None,
+    "textual not installed",
+)
+class TestFundeeAppVolumeFilterToggle(unittest.TestCase):
+    """TUI-level test: pressing 'v' toggles the volume filter state."""
 
     def setUp(self):
-        # Skip the test class if textual isn't installed (headless envs).
         import textual  # noqa: F401
+
         from fundee import FundeeApp
         self.FundeeApp = FundeeApp
 
-    def _build_app(self, autokill=True, volume_filter=True):
+    def _build_app(self, volume_filter=True):
         with patch("fundee.ExchangeInterface") as mock_ei:
             mock_ei.return_value = MagicMock()
-            app = self.FundeeApp(autokill=autokill, volume_filter=volume_filter)
-        # Stop the periodic intervals so they don't race the test by
-        # overwriting balance/positions with mock return values.
+            app = self.FundeeApp(volume_filter=volume_filter)
         app.logic.start = lambda: None
-        # Replace volatile state so update_ui() doesn't trip on MagicMock.
         app.logic.balance = Decimal("0.0")
         app.logic.viable_pairs = []
         app.logic.ticker_map = {}
@@ -1232,40 +1156,9 @@ class TestFundeeAppAutokillToggle(unittest.TestCase):
         app.logic.closed_strategies = []
         return app
 
-    def test_toggle_autokill_binding_flips_state(self):
-        import asyncio
-        app = self._build_app(autokill=True)
-
-        async def run():
-            async with app.run_test() as pilot:
-                await pilot.pause()
-                self.assertTrue(app.logic.autokill_enabled)
-                await pilot.press("k")
-                await pilot.pause()
-                self.assertFalse(app.logic.autokill_enabled)
-                await pilot.press("k")
-                await pilot.pause()
-                self.assertTrue(app.logic.autokill_enabled)
-
-        asyncio.run(run())
-
-    def test_toggle_autokill_starts_disabled(self):
-        import asyncio
-        app = self._build_app(autokill=False)
-
-        async def run():
-            async with app.run_test() as pilot:
-                await pilot.pause()
-                self.assertFalse(app.logic.autokill_enabled)
-                # Indicator widget has the OFF class applied.
-                w = app.query_one("#autokill_display")
-                self.assertIn("autokill_off", " ".join(w.classes))
-
-        asyncio.run(run())
-
     def test_toggle_volume_filter_binding_flips_state(self):
         import asyncio
-        app = self._build_app(autokill=True, volume_filter=True)
+        app = self._build_app(volume_filter=True)
 
         async def run():
             async with app.run_test() as pilot:
@@ -1282,7 +1175,7 @@ class TestFundeeAppAutokillToggle(unittest.TestCase):
 
     def test_toggle_volume_filter_starts_disabled(self):
         import asyncio
-        app = self._build_app(autokill=True, volume_filter=False)
+        app = self._build_app(volume_filter=False)
 
         async def run():
             async with app.run_test() as pilot:
@@ -1305,7 +1198,7 @@ class TestSimPosition(unittest.TestCase):
     def test_pnl_calculation_short(self):
         # Entry at 50000 (SHORT)
         pos = SimPosition("BTC/USDC:USDC", "A", self.playbook_a, 50000.0, self.funding_rate, self.funding_time)
-        
+
         # Price drops to 49500 (1% gain)
         pos.update(49500.0, 49501.0)
         self.assertEqual(pos.raw_pnl_pct, 1.0)
@@ -1317,7 +1210,7 @@ class TestSimPosition(unittest.TestCase):
         # Raw SL = -1.5 / 3 = -0.5%
         # SL Price = 50000 * (1 - (-0.005)) = 50250
         pos = SimPosition("BTC/USDC:USDC", "A", self.playbook_a, 50000.0, self.funding_rate, self.funding_time)
-        
+
         # Price hits 50250
         status = pos.update(50250.0, 50251.0)
         self.assertEqual(status, "CLOSED_SL")
@@ -1331,22 +1224,22 @@ class TestSimPosition(unittest.TestCase):
         # self.trail_trigger_pct = abs(funding_rate) * 100 * TRAIL_TRIGGER_MULT
         # = 0.001 * 100 * 2.0 = 0.2% (leveraged PnL trigger)
         # self.trail_pullback_pct = abs(funding_rate) * 100 * TRAIL_PULLBACK_MULT = 0.1%
-        
+
         pos = SimPosition("BTC/USDC:USDC", "A", self.playbook_a, 50000.0, self.funding_rate, self.funding_time)
-        
+
         # 1. Reach trigger: Price drops to 49966.67
         # Raw PnL = (50000 - 49966.67) / 50000 = 0.0006666 = 0.06666%
         # Lev PnL = 0.2% (Triggered)
         pos.update(49966.66, 49966.67)
         self.assertTrue(pos.trail_active)
         self.assertAlmostEqual(pos.max_leveraged_pnl_pct, 0.2, places=2)
-        
+
         # 2. Peak at 49900
         # Raw PnL = (50000 - 49900) / 50000 = 0.002 = 0.2%
         # Lev PnL = 0.6%
         pos.update(49900.0, 49901.0)
         self.assertAlmostEqual(pos.max_leveraged_pnl_pct, 0.6)
-        
+
         # 3. Pullback: Price rises to 49916.67
         # Raw PnL = (50000 - 49916.67) / 50000 = 0.001666 = 0.1666%
         # Lev PnL = 0.5%
@@ -1358,7 +1251,7 @@ class TestSimPosition(unittest.TestCase):
     def test_expiration_exit(self):
         funding_time_past = time.time() - 301 # Expired
         pos = SimPosition("BTC/USDC:USDC", "A", self.playbook_a, 50000.0, self.funding_rate, funding_time_past)
-        
+
         status = pos.update(50000.0, 50001.0)
         self.assertEqual(status, "CLOSED_EXPIRED")
 

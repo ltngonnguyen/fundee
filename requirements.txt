@@ -1,8 +1,12 @@
-pandas
-requests
-textual
-web3>=6.0.0
-eth-account>=0.8.0
-eth-abi>=4.0.0
-pytest
-coverage
+pandas>=2.0
+requests>=2.31
+textual>=0.50
+rich>=13.0
+ccxt>=4.2.0
+gradio>=5.0
+
+# Development/test dependencies. The canonical setup is `uv sync --extra dev`.
+pytest>=7.0
+pytest-mock>=3.10
+coverage>=7.0
+ruff>=0.5

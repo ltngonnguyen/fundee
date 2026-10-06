@@ -12,7 +12,6 @@ import argparse
 import logging
 import threading
 import time
-from datetime import timedelta
 
 import gradio as gr
 import pandas as pd
@@ -21,7 +20,12 @@ from fundee_shared import ExchangeInterface
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_TAKER_FEE = 0.00045
+MIN_VOLUME = 500000
+SPREAD_CAP = 0.005
+
 # ── Data-fetching thread ────────────────────────
+
 
 class DataFetcher:
     def __init__(self, exchange):
@@ -38,6 +42,13 @@ class DataFetcher:
         self._hip3_per_dex = {}
         # Dex names in order matching allPerpMetas indices (after native[0])
         self._hip3_dex_names = []
+        # Per-asset growthMode: {raw_name: bool}
+        self._growth_mode = {}
+        # deployerFeeScale per dex: {dex_name: float}
+        self._deployer_fee_scales = {}
+        # User fee schedule from userFees
+        self._user_cross_rate = DEFAULT_TAKER_FEE
+        self._referral_discount = 0.0
 
     def start(self):
         self.exchange.log("[gradio] loading markets from Hyperliquid (may take a few seconds)…")
@@ -47,6 +58,12 @@ class DataFetcher:
             f"[gradio] load_markets done in {(time.time() - t0):.2f}s — "
             f"{len(self.exchange.precision_map)} swap markets available"
         )
+
+        # Fetch user fee schedule for referral discount
+        self._fetch_user_fees()
+
+        # Fetch per-dex deployerFeeScale for accurate HIP-3 fee computation
+        self._fetch_deployer_fee_scales()
 
         # Discover ALL perp DEXes (native + HIP-3 builders) via allPerpMetas.
         # allPerpMetas returns a flat list of dicts, one per DEX, each with:
@@ -82,9 +99,7 @@ class DataFetcher:
                 self.exchange.log(
                     f"[gradio]   {dex_name}: {len(universe)} markets (e.g. {universe[0].get('name', '?')}, ... {universe[-1].get('name', '?')})"
                 )
-            self.exchange.log(
-                f"[gradio]   native: {len(native_markets)} markets from allPerpMetas"
-            )
+            self.exchange.log(f"[gradio]   native: {len(native_markets)} markets from allPerpMetas")
 
         # Build a mapping: raw HIP-3 symbol (e.g. "xyz:SKHX") → ccxt symbol
         # We need this because ccxt normalizes "xyz:SKHX" → "XYZ-SKHX/USDC:USDC"
@@ -110,12 +125,13 @@ class DataFetcher:
             dex_name = self._hip3_dex_names[i - 1]  # offset by native
             for u in universe:
                 raw_name = u.get("name", "")
+                self._growth_mode[raw_name] = u.get("growthMode") == "enabled"
                 # raw_name e.g. "xyz:SKHX" → ccxt base becomes "XYZ-SKHX"
                 parts = raw_name.split(":")
                 if len(parts) != 2:
                     continue
                 prefix, asset = parts
-                ccxt_base = prefix.upper() + "-asset}"
+                ccxt_base = f"{prefix.upper()}-{asset}"
                 ccxt_sym = _by_base.get(ccxt_base)
                 if ccxt_sym:
                     self._hip3_symbol_map[raw_name] = ccxt_sym
@@ -124,7 +140,9 @@ class DataFetcher:
                 else:
                     # Try alternate: ccxt might use different base format
                     for candidate_base, candidate_sym in _by_base.items():
-                        if candidate_base.startswith(prefix.upper() + "-") and candidate_base.endswith(asset.upper()):
+                        if candidate_base.startswith(
+                            prefix.upper() + "-"
+                        ) and candidate_base.endswith(asset.upper()):
                             self._hip3_symbol_map[raw_name] = candidate_sym
                             self._hip3_ccxt_syms_all.append(candidate_sym)
                             per_dex[dex_name].append(raw_name)
@@ -135,14 +153,57 @@ class DataFetcher:
 
         for name, syms in self._hip3_per_dex.items():
             self.exchange.log(f"[gradio]   {name}: mapped {len(syms)} ccxt symbols")
-        self.exchange.log(
-            f"[gradio] total HIP-3 symbols mapped: {len(self._hip3_symbol_map)}"
-        )
+        self.exchange.log(f"[gradio] total HIP-3 symbols mapped: {len(self._hip3_symbol_map)}")
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
     def stop(self):
         self._running = False
+
+    def _fetch_user_fees(self):
+        """Fetch userFees for referral discount and base fee rates."""
+        try:
+            wallet = self.exchange.exchange.walletAddress or ""
+            resp = self.exchange.exchange.public_post_info(
+                {"type": "userFees", "user": wallet}
+            )
+            self._user_cross_rate = float(resp.get("userCrossRate", DEFAULT_TAKER_FEE))
+            self._referral_discount = float(resp.get("activeReferralDiscount", 0))
+            self.exchange.log(
+                f"[gradio] userFees: cross={self._user_cross_rate}, referral_discount={self._referral_discount}"
+            )
+        except Exception as e:
+            self.exchange.log(f"[gradio] userFees failed, using defaults: {e}")
+
+    def _fetch_deployer_fee_scales(self):
+        """Fetch perpDexs for deployerFeeScale per HIP-3 dex."""
+        try:
+            dex_list = self.exchange.exchange.public_post_info({"type": "perpDexs"})
+            for dex_info in dex_list:
+                if not isinstance(dex_info, dict):
+                    continue
+                name = dex_info.get("name", "")
+                scale = dex_info.get("deployerFeeScale")
+                if name and scale is not None:
+                    self._deployer_fee_scales[name] = float(scale)
+                    self.exchange.log(f"[gradio]   {name}: deployerFeeScale={scale}")
+        except Exception as e:
+            self.exchange.log(f"[gradio] perpDexs failed: {e}")
+
+    def _compute_taker_fee(self, symbol, is_hip3=False, dex_name=None, growth_mode=False):
+        """Compute the actual taker fee rate for a symbol using the Hyperliquid fee formula.
+
+        For native perps: fee = userCrossRate * (1 - referralDiscount)
+        For HIP-3 perps:  fee = userCrossRate * scaleIfHip3 * growthModeScale * (1 - referralDiscount)
+        """
+        base = self._user_cross_rate
+        disc = 1 - self._referral_discount
+        if not is_hip3:
+            return base * disc
+        dfs = self._deployer_fee_scales.get(dex_name, 0)
+        scale_if_hip3 = (dfs + 1) if dfs < 1 else (dfs * 2)
+        growth_scale = 0.1 if growth_mode else 1.0
+        return base * scale_if_hip3 * growth_scale * disc
 
     def _loop(self):
         while self._running:
@@ -158,12 +219,10 @@ class DataFetcher:
         # ── 1. Native Hyperliquid perps (via ccxt) ──
         try:
             funding_rates = self.exchange.exchange.fetch_funding_rates()
-            # Only fetch tickers for symbols that have funding rates (much faster:
-            # ~180 symbols vs 341, avoids dead HIP-3 symbols with no live price data)
             fr_symbols = set(funding_rates.keys()) & set(self.exchange.precision_map.keys())
             tickers = self.exchange.exchange.fetch_tickers(list(fr_symbols))
         except Exception:
-            return  # skip cycle
+            return
 
         for sym, fr_data in funding_rates.items():
             if sym not in self.exchange.precision_map:
@@ -171,19 +230,29 @@ class DataFetcher:
             tik = tickers.get(sym, {})
             ask = float(tik.get("ask") or 0)
             bid = float(tik.get("bid") or 0)
+            quote_vol = float(tik.get("quoteVolume") or 0)
             if ask <= 0 or bid < 0:
                 continue
             rate = float(fr_data.get("fundingRate", 0) or 0)
+            taker_fee = self._compute_taker_fee(sym)
             spread_pct = ((ask - bid) / ask * 100) if ask > 0 else 0.0
-            nxt = fr_data.get("nextFundingTimestamp") or fr_data.get("fundingTimestamp")
-            cd = self._countdown(nxt)
+            net_yield = abs(rate) - (2 * taker_fee)
             interval_h = self.exchange.funding_interval_hours.get(sym, 1)
-            rows.append(self._make_row(sym, ask, rate, interval_h, cd, spread_pct))
+            is_native = interval_h != 1 or "://" not in sym
+            interval_ok = interval_h == 1 if is_native else True
+            nxt = fr_data.get("fundingTimestamp") or fr_data.get("nextFundingTime")
+            row = self._make_row(
+                sym, ask, rate, quote_vol, spread_pct, net_yield * 100, interval_h, interval_ok, nxt, taker_fee
+            )
+            rows.append(row)
 
-        # ── 2. HIP-3 builder-deployed perps (all dexes: xyz, flx, vntl, hyna, km, etc.) ──
-        # Fetch all HIP-3 tickers in one bulk call
+        # ── 2. HIP-3 builder-deployed perps ──
         try:
-            hip3_tickers = self.exchange.exchange.fetch_tickers(self._hip3_ccxt_syms_all) if self._hip3_ccxt_syms_all else {}
+            hip3_tickers = (
+                self.exchange.exchange.fetch_tickers(self._hip3_ccxt_syms_all)
+                if self._hip3_ccxt_syms_all
+                else {}
+            )
         except Exception:
             hip3_tickers = {}
 
@@ -191,16 +260,17 @@ class DataFetcher:
             if not raw_symbols:
                 continue
             try:
-                resp = self.exchange.exchange.public_post_info({
-                    "type": "metaAndAssetCtxs",
-                    "dex": dex_name,
-                })
+                resp = self.exchange.exchange.public_post_info(
+                    {
+                        "type": "metaAndAssetCtxs",
+                        "dex": dex_name,
+                    }
+                )
             except Exception:
                 continue
 
             universe = resp[0].get("universe", [])
             asset_ctxs = resp[1]
-            # Build index from raw name → ctx for O(1) lookup
             ctx_by_name = {}
             for i, u in enumerate(universe):
                 if i < len(asset_ctxs):
@@ -219,18 +289,35 @@ class DataFetcher:
                 tik = hip3_tickers.get(ccxt_sym, {})
                 ask = float(tik.get("ask") or 0)
                 bid = float(tik.get("bid") or 0)
+                quote_vol = float(tik.get("quoteVolume") or 0)
                 if ask <= 0:
                     continue
 
+                taker_fee = self._compute_taker_fee(
+                    ccxt_sym, is_hip3=True, dex_name=dex_name,
+                    growth_mode=self._growth_mode.get(raw_sym, False),
+                )
                 spread_pct = ((ask - bid) / ask * 100) if ask > 0 else 0.0
-                cd = self._countdown(None)
+                net_yield = abs(rate) - (2 * taker_fee)
                 interval_h = self.exchange.funding_interval_hours.get(ccxt_sym, 1)
-                rows.append(self._make_row(ccxt_sym, ask, rate, interval_h, cd, spread_pct))
+                interval_ok = interval_h == 1
+                nxt = ctx.get("nextFundingTime")
+                row = self._make_row(
+                    ccxt_sym,
+                    ask,
+                    rate,
+                    quote_vol,
+                    spread_pct,
+                    net_yield * 100,
+                    interval_h,
+                    interval_ok,
+                    nxt,
+                    taker_fee,
+                )
+                rows.append(row)
 
-        # Sort by abs(funding) descending
         rows.sort(key=lambda r: r["Abs Funding"], reverse=True)
 
-        # Try to fetch balance (non-critical)
         balance = "N/A"
         try:
             bal = self.exchange.get_balance()
@@ -243,25 +330,46 @@ class DataFetcher:
             self.rows = rows
             self.balance = balance
 
-    def _countdown(self, nxt):
+    def _is_viable(self, row):
+        if row["Spread"] > SPREAD_CAP * 100:
+            return False
+        if row["Volume"] < MIN_VOLUME:
+            return False
+        if row["Net Yield"] <= 0:
+            return False
+        return "⚠" not in row["Interval"]
+
+    def _make_row(
+        self, sym, ask, rate, quote_vol, spread_pct, net_yield_pct, interval_h, interval_ok, nxt=None, taker_fee=DEFAULT_TAKER_FEE
+    ):
+        abs_funding = abs(rate) * 100
+        interval_lbl = f"{interval_h}h" if interval_ok else f"{interval_h}h ⚠"
+        direction = "SHORT" if rate > 0 else "LONG"
+        taker_fee_pct = taker_fee * 100
+        cd = ""
         if nxt:
             d = (float(nxt) / 1000) - time.time()
-            return str(timedelta(seconds=int(d))) if d > 0 else "FUNDING"
-        return "N/A"
-
-    def _make_row(self, sym, ask, rate, interval_h, cd, spread_pct):
-        abs_funding = abs(rate) * 100
-        interval_lbl = f"{interval_h}h"
-        return {
+            if d > 0:
+                m, s = divmod(int(d), 60)
+                h, m = divmod(m, 60)
+                cd = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+            else:
+                cd = "FUNDING"
+        row = {
             "Symbol": sym,
             "Price": ask,
             "Abs Funding": abs_funding,
             "Funding": rate * 100,
-            "Dir": "SHORT" if rate > 0 else "LONG" if rate < 0 else "—",
+            "Direction": direction,
             "Interval": interval_lbl,
             "Countdown": cd,
             "Spread": spread_pct,
+            "Volume": quote_vol,
+            "Taker Fee": taker_fee_pct,
+            "Net Yield": net_yield_pct,
         }
+        row["Viable"] = "✓" if self._is_viable(row) else "✗"
+        return row
 
     def get_df(self):
         with self._lock:
@@ -273,6 +381,7 @@ class DataFetcher:
 
 
 # ── App ──────────────────
+
 
 def build_header(fetcher):
     bal = fetcher.get_balance()
@@ -286,7 +395,10 @@ def refresh_ui(fetcher):
     df = fetcher.get_df()
     bal = fetcher.get_balance()
     n_pairs = len(df)
-    header = f"**Balance:** {bal}  |  **Pairs:** {n_pairs}  |  **Updated:** {time.strftime('%H:%M:%S')}"
+    n_viable = len(df[df["Viable"] == "✓"]) if "Viable" in df.columns else 0
+    header = (
+        f"**Balance:** {bal}  |  **Pairs:** {n_pairs}  |  **Viable:** {n_viable}  |  **Updated:** {time.strftime('%H:%M:%S')}"
+    )
     return df, header
 
 
@@ -300,12 +412,25 @@ def create_app(testnet=False):
 
     with gr.Blocks(title="FunDee — Hyperliquid Market Scanner", theme=gr.themes.Soft()) as app:
         gr.Markdown("# FunDee — Hyperliquid Market Scanner")
-        header_md = gr.Markdown("**Balance:** —  |  **Pairs:** —  |  **Updated:** —")
+        header_md = gr.Markdown("**Balance:** —  |  **Pairs:** —  |  **Viable:** —  |  **Updated:** —")
 
         table = gr.Dataframe(
-            headers=["Symbol", "Price", "Abs Funding", "Funding", "Dir", "Interval", "Countdown", "Spread"],
-            datatype=["str", "number", "number", "number", "str", "str", "str", "number"],
-            column_widths=["16%", "10%", "12%", "10%", "10%", "8%", "10%", "12%"],
+            headers=[
+                "Symbol",
+                "Price",
+                "Abs Funding",
+                "Funding",
+                "Direction",
+                "Interval",
+                "Countdown",
+                "Spread",
+                "Volume",
+                "Taker Fee",
+                "Net Yield",
+                "Viable",
+            ],
+            datatype=["str", "number", "number", "number", "str", "str", "str", "number", "number", "number", "number", "str"],
+            column_widths=["14%", "8%", "10%", "8%", "7%", "6%", "8%", "8%", "10%", "7%", "8%", "6%"],
             interactive=False,
             max_height=800,
             wrap=True,

@@ -4,12 +4,11 @@ After=network.target
 
 [Service]
 Type=simple
-EnvironmentFile=/home/johnd/fundee/.env
-User=johnd
-WorkingDirectory=/home/johnd/fundee
-ExecStart=/home/johnd/.local/bin/uv run --env-file /home/johnd/fundee/.env python /home/johnd/fundee/fundee_dryrun.py
+EnvironmentFile=%h/fundee/.env
+WorkingDirectory=%h/fundee
+ExecStart=/usr/bin/env uv run --env-file %h/fundee/.env python fundee_dryrun.py
 Restart=always
 RestartSec=5
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

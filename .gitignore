@@ -1,7 +1,35 @@
+# Local credentials and runtime configuration
+.env
+.env.*
+!.env.example
+
+# Python virtual environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Build/package artifacts
+build/
+dist/
+*.egg-info/
+
+# Runtime output
+logs/
 *.csv
 *.log
-*.env
-venv/
-__pycache__/
-logs/
-.coverage
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

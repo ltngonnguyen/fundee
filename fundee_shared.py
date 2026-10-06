@@ -160,9 +160,15 @@ class ExchangeInterface:
             return None
 
     def get_commission_rate(self, symbol):
-        # ccxt.hyperliquid does not implement fetchTradingFees. Use the user's
-        # actual Hyperliquid tier rates (0.0432% maker / 0.0144% taker).
-        return {"maker": 0.000432, "taker": 0.000144}
+        try:
+            fee = self.exchange.fetch_trading_fee(symbol)
+            return {
+                "maker": fee.get("maker", 0.00015),
+                "taker": fee.get("taker", 0.00045),
+            }
+        except Exception as e:
+            self.log(f"Fee fetch error for {symbol}: {e}")
+            return {"maker": 0.00015, "taker": 0.00045}
 
     # ---------- Account ----------
 
@@ -524,16 +530,20 @@ class SmartOrderExecutor:
 
                     if not should_cancel:
                         current_p = float(status.get("price", self.last_price))
-                        if self.side == "BUY":
-                            if not self.aggressive and price > current_p:
-                                should_cancel = True
-                            elif self.aggressive and best_ask > current_p:
-                                should_cancel = True
-                        elif self.side == "SELL":
-                            if not self.aggressive and price < current_p:
-                                should_cancel = True
-                            elif self.aggressive and best_bid < current_p:
-                                should_cancel = True
+                        if (
+                            self.side == "BUY"
+                            and (
+                                (not self.aggressive and price > current_p)
+                                or (self.aggressive and best_ask > current_p)
+                            )
+                        ) or (
+                            self.side == "SELL"
+                            and (
+                                (not self.aggressive and price < current_p)
+                                or (self.aggressive and best_bid < current_p)
+                            )
+                        ):
+                            should_cancel = True
 
                     if should_cancel:
                         self.log(

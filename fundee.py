@@ -10,7 +10,7 @@ from queue import Queue
 
 try:
     from textual.app import App, ComposeResult
-    from textual.containers import Horizontal, Vertical, VerticalScroll
+    from textual.containers import Horizontal, VerticalScroll
     from textual.widgets import DataTable, Footer, Header, Log, Static
 
     TEXTUAL_INSTALLED = True
@@ -41,13 +41,8 @@ MIN_NOTIONAL = Decimal("5.5")
 
 
 class FundeeLogic:
-    def __init__(self, interface, autokill=True, volume_filter=True):
+    def __init__(self, interface, volume_filter=True):
         self.interface = interface
-        # Auto-kill (safety monitor) enabled by default. Operator can disable
-        # via --no-kill on the CLI or 'k' in the TUI. When disabled, the
-        # bot opens/closes via its own entry/exit logic only — it will not
-        # autonomously close a position that survived a funding cycle.
-        self.autokill_enabled = autokill
         # Volume gate: when enabled, pairs with 24h quoteVolume < 500k are
         # excluded from viable_pairs. Disable via --no-volume or 'v' in TUI.
         self.volume_filter_enabled = volume_filter
@@ -126,7 +121,7 @@ class FundeeLogic:
 
                     os.rename(log_file, rotated_file)
                     self.interface.log_message(
-                        f"Log file rotated: trade_anchors.csv -> trade_anchors.csv.1"
+                        "Log file rotated: trade_anchors.csv -> trade_anchors.csv.1"
                     )
 
                     # Create new file with header
@@ -157,9 +152,6 @@ class FundeeLogic:
         self.interface.set_interval(1.0, self.fetch_tickers)
         self.interface.set_interval(1.0, self.update_strategies)
         self.interface.set_interval(2.0, self.process_fee_queue)
-        self.interface.set_interval(
-            5.0, self.safety_monitor
-        )  # Run safety check every 5s
         self.refresh_all()
 
     def refresh_all(self):
@@ -215,104 +207,6 @@ class FundeeLogic:
                         self.ignored_dust.remove(sym)
 
         self.interface.update_ui()
-
-    def safety_monitor(self):
-        """
-        Integrated 'Killer Bot' logic.
-        Ensures no positions remain open outside the designated funding window (xx:59 - xx:00:30).
-        """
-        # Auto-kill is opt-out: when disabled, the safety monitor is a no-op.
-        # The bot still opens/closes via update_strategies — operator takes
-        # responsibility for any position that survives a funding cycle.
-        if not self.autokill_enabled:
-            return
-
-        now = datetime.now()
-        minute = now.minute
-        second = now.second
-
-        # Safe Zones: 59 (Pre-Funding), 00:00-00:30 (Funding + Buffer)
-        # Kill Zone: All others
-        if minute == 59:
-            return
-        if minute == 0 and second < 30:
-            return
-
-        # Check for stray positions
-        for p in self.real_positions:
-            symbol = p["symbol"]
-            amt = float(p["positionAmt"])
-
-            if amt == 0:
-                continue
-            with self._pending_orders_lock:
-                is_pending = symbol in self.pending_orders
-            if is_pending:
-                # Log why we are skipping to aid debugging
-                # But don't spam logs every 5s if it's normal.
-                # We'll log only if it's been pending for a while?
-                # For now, just logging at debug level is safest if we had levels,
-                # but since we print, let's just leave a comment or log if it persists?
-                # The user asked for detailed logs about failure to kill.
-                self.interface.log_message(
-                    f"SAFETY: Skipping {symbol} (Already Pending Operation)"
-                )
-                continue  # Don't kill if we are already working on it
-            if symbol in self.ignored_dust:
-                continue  # Skip known dust
-
-            # KILL IT
-            self.interface.notify(
-                f"SAFETY: Killing stray position {symbol} ({amt})", severity="warning"
-            )
-            self.pending_orders.add(symbol)  # Lock it
-
-            close_side = "BUY" if amt < 0 else "SELL"
-
-            # Define callbacks
-            def _on_success(fill, avg, oid, role):
-                self.interface.notify(
-                    f"SAFETY: Killed {symbol} @ {avg}", severity="warning"
-                )
-                self.remove_pending(symbol)
-                # Also try to find and close any matching local strategy to keep UI in sync
-                found = False
-                for s in self.active_strategies:
-                    if s["symbol"] == symbol and s["status"] != "CLOSED":
-                        s["status"] = "CLOSED"
-                        s["exit_price"] = avg
-                        s["exit_time"] = time.time()
-                        s["reason"] = "Safety Kill"
-                        self.closed_strategies.append(s)
-                        found = True
-                if found:
-                    self.active_strategies = [
-                        s for s in self.active_strategies if s["status"] != "CLOSED"
-                    ]
-
-                self.sync_balance_positions()
-
-            def _on_fail(err):
-                self.interface.notify(
-                    f"SAFETY: Kill failed for {symbol}: {err}", severity="error"
-                )
-                self.remove_pending(symbol)
-                if "Dust Position" in str(err):
-                    self.interface.notify(
-                        f"Ignoring Dust: {symbol}", severity="information"
-                    )
-                    self.ignored_dust.add(symbol)
-
-            # Use close_all_positions (Market Close All) to handle dust safely
-            def _close_worker():
-                res = self.exchange.close_all_positions(symbol, close_side)
-                if res and "orderId" in res:
-                    # Success: Trigger placed
-                    _on_success(0, 0, res["orderId"], "MARKET_CLOSE")
-                else:
-                    _on_fail(str(res))
-
-            self.interface.run_worker(_close_worker)
 
     def fetch_premiums(self):
         self.interface.run_worker(self.fetch_premiums_worker)
@@ -507,7 +401,7 @@ class FundeeLogic:
             # `abs()` is restored: the bot trades BOTH sides, picking direction
             # by sign (rate > 0 → SHORT to collect, rate < 0 → LONG to collect).
             # No `MIN_PROFIT_BUFFER` — only the spread cap acts as the floor.
-            net_yield = abs(rate) - Decimal(str(fee_cost)) - spread
+            net_yield = abs(rate) - Decimal(str(fee_cost))
 
             # Record for the top-5 promising log regardless of viability.
             all_yields.append((sym, rate, net_yield))
@@ -824,7 +718,6 @@ class FundeeLogic:
                 f"tickers={n_tickers}, viable_pairs={n_viable}, "
                 f"active_strategies={len(self.active_strategies)}, "
                 f"strategy={ACTIVE_STRATEGY}, "
-                f"autokill={'ON' if self.autokill_enabled else 'OFF'}, "
                 f"volfilt={'ON' if self.volume_filter_enabled else 'OFF'}"
             )
             # Top promising by net yield — surfaces "almost promising" pairs that the
@@ -869,7 +762,7 @@ class FundeeLogic:
             fee_cost = fees["taker"] * 2  # Assume taker for entry safety
 
             # Re-calculate profitability (must match process_premiums formula)
-            net_yield = abs(cand["funding_rate"]) - fee_cost - spread
+            net_yield = abs(cand["funding_rate"]) - fee_cost
 
             # If the market has turned against us in the last 59 seconds, ABORT.
             if spread > Decimal("0.005") or net_yield <= 0:
@@ -897,18 +790,17 @@ class FundeeLogic:
                         funding_time_ms=cand["next_funding_time"],
                         funding_rate=cand["funding_rate"],
                     )
-            elif ACTIVE_STRATEGY == "APPROACH_B":
+            elif ACTIVE_STRATEGY == "APPROACH_B" and 0 < diff <= APPROACH_B_ENTRY_WINDOW:
                 # APPROACH B: 1s market in
-                if 0 < diff <= APPROACH_B_ENTRY_WINDOW:
-                    self.execute_strategy_entry(
-                        "APPROACH_B",
-                        symbol,
-                        direction,
-                        maker=False,
-                        funding_time_ms=cand["next_funding_time"],
-                        funding_rate=cand["funding_rate"],
-                        use_market=True,
-                    )
+                self.execute_strategy_entry(
+                    "APPROACH_B",
+                    symbol,
+                    direction,
+                    maker=False,
+                    funding_time_ms=cand["next_funding_time"],
+                    funding_rate=cand["funding_rate"],
+                    use_market=True,
+                )
 
         # EXIT LOGIC
         with self._active_strategies_lock:
@@ -968,20 +860,18 @@ class FundeeLogic:
                 )
 
             # Time-based Exit
-            # Exit passively 1s after funding.
-            # If we fail, killer_bot (running in parallel) will sweep us at T+60s.
+            # Exit at funding time (funding credited atomically at snapshot).
             elif strategy == "STRADDLE":
                 funding_time = s.get("funding_time", 0)
                 if funding_time > 0:
                     time_since_funding = current_time - funding_time
-                    if time_since_funding > APPROACH_B_ENTRY_WINDOW:
+                    if time_since_funding >= 0:
                         self.execute_strategy_exit(s, "Post-Funding Exit", maker=True)
             elif strategy == "APPROACH_B":
                 funding_time = s.get("funding_time", 0)
                 if funding_time > 0:
                     time_since_funding = current_time - funding_time
-                    # Exit strictly via Market 1s after funding
-                    if time_since_funding > APPROACH_B_ENTRY_WINDOW:
+                    if time_since_funding >= 0:
                         self.execute_strategy_exit(
                             s,
                             "Post-Funding Exit (Approach B)",
@@ -995,13 +885,12 @@ class FundeeLogic:
 class HeadlessInterface:
     MAX_WORKERS = 10
 
-    def __init__(self, autokill=True, volume_filter=True):
+    def __init__(self, volume_filter=True):
         self.running = True
         self.tasks = []
         self.queue = Queue()
         self._active_workers = 0
         self._workers_lock = threading.Lock()
-        self._autokill = autokill
         self._volume_filter = volume_filter
 
     def set_interval(self, interval, func):
@@ -1044,14 +933,10 @@ class HeadlessInterface:
         pass
 
     def run(self):
-        self.logic = FundeeLogic(self, autokill=self._autokill, volume_filter=self._volume_filter)
+        self.logic = FundeeLogic(self, volume_filter=self._volume_filter)
         print(
             f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting REAL TRADING Bot (LIVE Mode)..."
         )
-        if not self._autokill:
-            print(
-                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] AutoKill: OFF (safety monitor disabled; positions will NOT be force-closed)"
-            )
         if not self._volume_filter:
             print(
                 f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Volume filter: OFF (all pairs pass regardless of 24h volume)"
@@ -1087,8 +972,6 @@ class FundeeApp(App):
     #sim_scroll { height: 1fr; }
     DataTable { height: 1fr; border: solid red; } /* Red border for REAL mode */
     .section_title { background: $primary; color: white; text-align: center; text-style: bold; height: 1; }
-    .autokill_on { background: $success; color: $text; text-style: bold; }
-    .autokill_off { background: $error; color: $text; text-style: bold; }
     .volfilter_on { background: $success; color: $text; text-style: bold; }
     .volfilter_off { background: $warning; color: $text; text-style: bold; }
     Log { height: 30%; border-top: solid $primary; background: $surface; display: none; }
@@ -1099,13 +982,12 @@ class FundeeApp(App):
         ("r", "refresh_all", "Refresh"),
         ("c", "clear_history", "Clear Hist"),
         ("l", "toggle_log", "Toggle Log"),
-        ("k", "toggle_autokill", "Toggle AutoKill"),
         ("v", "toggle_volume_filter", "Toggle VolFilter"),
     ]
 
-    def __init__(self, autokill=True, volume_filter=True):
+    def __init__(self, volume_filter=True):
         super().__init__()
-        self.logic = FundeeLogic(self, autokill=autokill, volume_filter=volume_filter)
+        self.logic = FundeeLogic(self, volume_filter=volume_filter)
         self._active_workers = 0
         self._workers_lock = threading.Lock()
         # Scanner sort state: column index (0-based), reverse flag
@@ -1121,11 +1003,6 @@ class FundeeApp(App):
                 f"REAL TRADING (LIVE MODE) | Balance: ... {QUOTE_CURRENCY}",
                 id="balance_display",
                 classes="section_title",
-            ),
-            Static(
-                "AutoKill: ON",
-                id="autokill_display",
-                classes="section_title autokill_on",
             ),
             Static(
                 "VolFilter: ON",
@@ -1188,15 +1065,6 @@ class FundeeApp(App):
         log = self.query_one("#debug_log", Log)
         log.styles.display = "block" if log.styles.display == "none" else "none"
 
-    def action_toggle_autokill(self):
-        self.logic.autokill_enabled = not self.logic.autokill_enabled
-        state = "ON" if self.logic.autokill_enabled else "OFF"
-        self.notify(
-            f"AutoKill: {state}",
-            severity="information" if self.logic.autokill_enabled else "warning",
-        )
-        self.update_ui()
-
     def action_toggle_volume_filter(self):
         self.logic.volume_filter_enabled = not self.logic.volume_filter_enabled
         state = "ON" if self.logic.volume_filter_enabled else "OFF"
@@ -1220,13 +1088,6 @@ class FundeeApp(App):
         self.query_one("#balance_display", Static).update(
             f"REAL TRADING (LIVE MODE) | Balance: ${self.logic.balance:.2f} {QUOTE_CURRENCY}"
         )
-        autokill_widget = self.query_one("#autokill_display", Static)
-        if self.logic.autokill_enabled:
-            autokill_widget.update("AutoKill: ON")
-            autokill_widget.set_classes("section_title autokill_on")
-        else:
-            autokill_widget.update("AutoKill: OFF")
-            autokill_widget.set_classes("section_title autokill_off")
         volfilt_widget = self.query_one("#volfilt_display", Static)
         if self.logic.volume_filter_enabled:
             volfilt_widget.update("VolFilter: ON")
@@ -1316,10 +1177,7 @@ class FundeeApp(App):
             nxt = self.logic.premium_data.get(sym, {}).get("next_funding_time")
             if nxt:
                 d = (float(nxt) / 1000) - time.time()
-                if d > 0:
-                    cd = str(timedelta(seconds=int(d)))
-                else:
-                    cd = "FUNDING"
+                cd = str(timedelta(seconds=int(d))) if d > 0 else "FUNDING"
 
             interval_h = self.logic.exchange.funding_interval_hours.get(sym, 1)
             interval_lbl = f"{interval_h}h"
@@ -1381,11 +1239,6 @@ if __name__ == "__main__":
         help="Use Hyperliquid testnet (sets sandboxMode on ccxt)",
     )
     parser.add_argument(
-        "--no-kill",
-        action="store_true",
-        help="Disable the safety monitor (no auto-close of stray positions). TUI 'k' toggles this at runtime.",
-    )
-    parser.add_argument(
         "--no-volume",
         action="store_true",
         help="Disable the 500k volume gate. TUI 'v' toggles this at runtime.",
@@ -1400,7 +1253,6 @@ if __name__ == "__main__":
         print("Textual library not found. Falling back to headless mode.")
         args.headless = True
 
-    autokill = not args.no_kill
     volume_filter = not args.no_volume
 
     try:
@@ -1409,9 +1261,9 @@ if __name__ == "__main__":
             os.makedirs("logs")
 
         if args.headless:
-            HeadlessInterface(autokill=autokill, volume_filter=volume_filter).run()
+            HeadlessInterface(volume_filter=volume_filter).run()
         else:
-            app = FundeeApp(autokill=autokill, volume_filter=volume_filter)
+            app = FundeeApp(volume_filter=volume_filter)
             app.run()
 
     finally:
