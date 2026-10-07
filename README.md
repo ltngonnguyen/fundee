@@ -1,5 +1,7 @@
 # Fundee
 
+![Fundee cover](cover.png)
+
 Fundee is a Python research and execution project for Hyperliquid perpetual-futures funding-rate strategies. It combines a live trading bot, a dry-run simulator, a browser market scanner, and unit-tested exchange abstractions built on top of `ccxt`.
 
 The project is designed to make funding opportunities observable, testable, and operationally safe before capital is deployed.
