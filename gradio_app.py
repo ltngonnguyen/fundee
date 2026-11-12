@@ -30,6 +30,7 @@ class DataFetcher:
         self.rows = []
         self.balance = "N/A"
         self._running = True
+        self.funding_interval = "1h"
         # Maps raw HIP-3 symbol name (e.g. "xyz:SKHX") → ccxt-normalized symbol
         self._hip3_symbol_map = {}
         # List of all HIP-3 ccxt symbols for bulk ticker fetching
@@ -177,8 +178,12 @@ class DataFetcher:
             spread_pct = ((ask - bid) / ask * 100) if ask > 0 else 0.0
             nxt = fr_data.get("nextFundingTimestamp") or fr_data.get("fundingTimestamp")
             cd = self._countdown(nxt)
+            # Snapshot the funding interval from native perps
             interval_h = self.exchange.funding_interval_hours.get(sym, 1)
             rows.append(self._make_row(sym, ask, rate, interval_h, cd, spread_pct))
+
+        # Assume all pairs (native + HIP-3) share the same interval
+        self.funding_interval = f"{self.exchange.funding_interval_hours.get(next(iter(funding_rates)), 1)}h"
 
         # ── 2. HIP-3 builder-deployed perps (all dexes: xyz, flx, vntl, hyna, km, etc.) ──
         # Fetch all HIP-3 tickers in one bulk call
@@ -224,8 +229,7 @@ class DataFetcher:
 
                 spread_pct = ((ask - bid) / ask * 100) if ask > 0 else 0.0
                 cd = self._countdown(None)
-                interval_h = self.exchange.funding_interval_hours.get(ccxt_sym, 1)
-                rows.append(self._make_row(ccxt_sym, ask, rate, interval_h, cd, spread_pct))
+                rows.append(self._make_row(ccxt_sym, ask, rate, 1, cd, spread_pct))
 
         # Sort by abs(funding) descending
         rows.sort(key=lambda r: r["Abs Funding"], reverse=True)
@@ -249,16 +253,13 @@ class DataFetcher:
             return str(timedelta(seconds=int(d))) if d > 0 else "FUNDING"
         return "N/A"
 
-    def _make_row(self, sym, ask, rate, interval_h, cd, spread_pct):
+    def _make_row(self, sym, ask, rate, _interval_h, cd, spread_pct):
         abs_funding = abs(rate) * 100
-        interval_lbl = f"{interval_h}h"
         return {
             "Symbol": sym,
             "Price": ask,
             "Abs Funding": abs_funding,
             "Funding": rate * 100,
-            "Dir": "SHORT" if rate > 0 else "LONG" if rate < 0 else "—",
-            "Interval": interval_lbl,
             "Countdown": cd,
             "Spread": spread_pct,
         }
@@ -286,7 +287,11 @@ def refresh_ui(fetcher):
     df = fetcher.get_df()
     bal = fetcher.get_balance()
     n_pairs = len(df)
-    header = f"**Balance:** {bal}  |  **Pairs:** {n_pairs}  |  **Updated:** {time.strftime('%H:%M:%S')}"
+    header = (
+        f"**Balance:** {bal}  |  **Pairs:** {n_pairs}  |  "
+        f"**Interval:** {fetcher.funding_interval}  |  "
+        f"**Updated:** {time.strftime('%H:%M:%S')}"
+    )
     return df, header
 
 
@@ -303,9 +308,9 @@ def create_app(testnet=False):
         header_md = gr.Markdown("**Balance:** —  |  **Pairs:** —  |  **Updated:** —")
 
         table = gr.Dataframe(
-            headers=["Symbol", "Price", "Abs Funding", "Funding", "Dir", "Interval", "Countdown", "Spread"],
-            datatype=["str", "number", "number", "number", "str", "str", "str", "number"],
-            column_widths=["16%", "10%", "12%", "10%", "10%", "8%", "10%", "12%"],
+            headers=["Symbol", "Price", "Abs Funding", "Funding", "Countdown", "Spread"],
+            datatype=["str", "number", "number", "number", "str", "number"],
+            column_widths=["20%", "12%", "14%", "12%", "14%", "14%"],
             interactive=False,
             max_height=800,
             wrap=True,
